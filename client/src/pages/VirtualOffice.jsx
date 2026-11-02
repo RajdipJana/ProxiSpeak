@@ -1,17 +1,18 @@
 
 import Header from "../components/Header";
-import { useState, useEffect, useRef, useCallback } from "react";
-import { io } from "socket.io-client";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useContext,
+} from "react";
+import socket from "../socket";
+import AppStatusContext from "../AppStatusContext";
 import "../App.css";
 import officeFloor from "../assets/office-floor.png";
 
-// Connect only while the Virtual Office is mounted.
-const socket = io("http://localhost:5000", {
-  autoConnect: false,
-});
-
 // Public STUN server helps peers discover direct connection paths.
-// Production deployments may also need a TURN server.
 const RTC_CONFIG = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
@@ -19,18 +20,22 @@ const RTC_CONFIG = {
 };
 
 function VirtualOffice({ user, onNavigate, onLogout }) {
-  const [employees, setEmployees] = useState([]);
+  // Shared application data — App.jsx manages the Socket.IO connection.
+  const {
+    employees = [],
+    connected = false,
+    nearbyEmployees = [],
+    voiceRange = 120,
+  } = useContext(AppStatusContext);
+
   const [myEmployeeId, setMyEmployeeId] = useState("");
-  const [connected, setConnected] = useState(false);
-  const [nearbyEmployees, setNearbyEmployees] = useState([]);
-  const [voiceRange, setVoiceRange] = useState(120);
 
   const [voiceJoined, setVoiceJoined] = useState(false);
   const [muted, setMuted] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const [remoteStreams, setRemoteStreams] = useState({});
 
-  // Refs keep the latest voice state available to Socket.IO handlers.
+  // WebRTC refs
   const localStreamRef = useRef(null);
   const peerConnectionsRef = useRef(new Map());
   const pendingCandidatesRef = useRef(new Map());
@@ -38,6 +43,11 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
   const nearbyRef = useRef([]);
   const voiceEnabledRef = useRef(false);
   const announcedPeersRef = useRef(new Set());
+
+  // Keep the latest nearby employees available to voice functions.
+  useEffect(() => {
+    nearbyRef.current = nearbyEmployees;
+  }, [nearbyEmployees]);
 
   // ==========================================
   // CLOSE A PEER CONNECTION
@@ -74,9 +84,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
   const createPeerConnection = useCallback((peerId) => {
     const existing = peerConnectionsRef.current.get(peerId);
 
-    if (existing) {
-      return existing;
-    }
+    if (existing) return existing;
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
     const localStream = localStreamRef.current;
@@ -126,8 +134,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
   // ==========================================
   // START AN OUTGOING WEBRTC OFFER
-  // Only the smaller socket ID initiates.
-  // Prevent duplicate offers during rejoining.
   // ==========================================
 
   const startOffer = useCallback(async (peerId) => {
@@ -151,8 +157,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // Do not send a stale offer if the user left voice
-      // or the peer connection was closed while awaiting.
       if (
         !voiceEnabledRef.current ||
         !socket.connected ||
@@ -187,28 +191,23 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
     } = {}) {
       if (!fromSocketId || !signal) return;
 
-      // The other user has left voice.
       if (signal.type === "voice-left") {
         closePeerConnection(fromSocketId);
         announcedPeersRef.current.delete(fromSocketId);
         return;
       }
 
-      // A nearby user is ready to establish voice.
       if (signal.type === "voice-ready") {
         if (
           voiceEnabledRef.current &&
           localStreamRef.current &&
           socket.connected
         ) {
-          // Reply even if this user was already nearby.
-          // This makes rejoining independent of avatar movement.
           socket.emit("voiceSignal", {
             targetSocketId: fromSocketId,
             signal: { type: "voice-ready-ack" },
           });
 
-          // Only the smaller socket ID initiates the offer.
           if (socket.id.localeCompare(fromSocketId) < 0) {
             await startOffer(fromSocketId);
           }
@@ -217,7 +216,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
         return;
       }
 
-      // The peer acknowledges our readiness message.
       if (signal.type === "voice-ready-ack") {
         if (
           voiceEnabledRef.current &&
@@ -231,8 +229,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
         return;
       }
 
-      // Do not establish audio connections unless the local
-      // user has explicitly joined voice.
       if (
         !voiceEnabledRef.current ||
         !localStreamRef.current
@@ -290,11 +286,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
               pendingCandidatesRef.current.get(fromSocketId) || [];
 
             queued.push(candidate);
-
-            pendingCandidatesRef.current.set(
-              fromSocketId,
-              queued
-            );
+            pendingCandidatesRef.current.set(fromSocketId, queued);
           }
         }
       } catch (error) {
@@ -313,19 +305,16 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
   }, [closePeerConnection, createPeerConnection, startOffer]);
 
   // ==========================================
-  // SOCKET.IO — OFFICE CONNECTION AND PROXIMITY
+  // SHARED SOCKET — OFFICE SESSION
   // ==========================================
 
   useEffect(() => {
     function handleConnect() {
       setMyEmployeeId(socket.id);
-      setConnected(true);
     }
 
     function handleDisconnect() {
-      setConnected(false);
-      setNearbyEmployees([]);
-      nearbyRef.current = [];
+      setMyEmployeeId("");
 
       voiceEnabledRef.current = false;
       setVoiceJoined(false);
@@ -347,85 +336,21 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       setRemoteStreams({});
     }
 
-    function handleEmployeesUpdate(updatedEmployees) {
-      setEmployees(updatedEmployees);
-    }
-
-    function handleProximityUpdate(data) {
-      const nearby = data.nearbyEmployees || [];
-
-      setNearbyEmployees(nearby);
-      nearbyRef.current = nearby;
-
-      if (Number.isFinite(data.voiceRange)) {
-        setVoiceRange(data.voiceRange);
-      }
-
-      const nearbyIds = new Set(
-        nearby.map((employee) => employee.socketId)
-      );
-
-      // Close connections when colleagues move out of range.
-      for (const peerId of peerConnectionsRef.current.keys()) {
-        if (!nearbyIds.has(peerId)) {
-          closePeerConnection(peerId);
-        }
-      }
-
-      // Permit a fresh connection if someone returns later.
-      for (const peerId of announcedPeersRef.current) {
-        if (!nearbyIds.has(peerId)) {
-          announcedPeersRef.current.delete(peerId);
-        }
-      }
-
-      // Announce voice availability to newly nearby colleagues.
-      if (voiceEnabledRef.current && socket.connected) {
-        nearby.forEach((employee) => {
-          const peerId = employee.socketId;
-
-          if (
-            !peerId ||
-            peerId === socket.id ||
-            announcedPeersRef.current.has(peerId)
-          ) {
-            return;
-          }
-
-          announcedPeersRef.current.add(peerId);
-
-          socket.emit("voiceSignal", {
-            targetSocketId: peerId,
-            signal: { type: "voice-ready" },
-          });
-        });
-      }
-    }
-
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
-    socket.on("employeesUpdate", handleEmployeesUpdate);
-    socket.on("proximityUpdate", handleProximityUpdate);
 
-    socket.auth = {
-      userId:
-        user?.username ||
-        user?.userId ||
-        user?.id ||
-        user?.name ||
-        "guest",
-      name: user?.name || user?.username || "Guest",
-    };
-
-    socket.connect();
+    // When returning from another page, the shared socket may
+    // already be connected. Set the current employee ID immediately.
+    if (socket.connected) {
+      handleConnect();
+    }
 
     return () => {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
-      socket.off("employeesUpdate", handleEmployeesUpdate);
-      socket.off("proximityUpdate", handleProximityUpdate);
 
-      // Stop media and close connections when leaving the page.
+      // Stop this page's voice resources, but DO NOT disconnect
+      // the shared Socket.IO connection managed by App.jsx.
       voiceEnabledRef.current = false;
 
       localStreamRef.current?.getTracks().forEach((track) => {
@@ -443,15 +368,52 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       announcedPeersRef.current.clear();
       offerInProgressRef.current.clear();
 
-      socket.disconnect();
+      setRemoteStreams({});
     };
-  }, [
-    user?.name,
-    user?.username,
-    user?.userId,
-    user?.id,
-    closePeerConnection,
-  ]);
+  }, [closePeerConnection]);
+
+  // ==========================================
+  // HANDLE PROXIMITY CHANGES FOR VOICE
+  // ==========================================
+
+  useEffect(() => {
+    const nearbyIds = new Set(
+      nearbyEmployees.map((employee) => employee.socketId)
+    );
+
+    for (const peerId of peerConnectionsRef.current.keys()) {
+      if (!nearbyIds.has(peerId)) {
+        closePeerConnection(peerId);
+      }
+    }
+
+    for (const peerId of announcedPeersRef.current) {
+      if (!nearbyIds.has(peerId)) {
+        announcedPeersRef.current.delete(peerId);
+      }
+    }
+
+    if (voiceEnabledRef.current && socket.connected) {
+      nearbyEmployees.forEach((employee) => {
+        const peerId = employee.socketId;
+
+        if (
+          !peerId ||
+          peerId === socket.id ||
+          announcedPeersRef.current.has(peerId)
+        ) {
+          return;
+        }
+
+        announcedPeersRef.current.add(peerId);
+
+        socket.emit("voiceSignal", {
+          targetSocketId: peerId,
+          signal: { type: "voice-ready" },
+        });
+      });
+    }
+  }, [nearbyEmployees, closePeerConnection]);
 
   // ==========================================
   // JOIN VOICE
@@ -483,8 +445,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
         video: false,
       });
 
-      // The component may have unmounted or disconnected
-      // while microphone permission was pending.
       if (!socket.connected) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -500,8 +460,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       setMuted(false);
       setVoiceJoined(true);
 
-      // Reset readiness tracking and announce again to everyone
-      // currently nearby, even if neither avatar has moved.
       announcedPeersRef.current.clear();
 
       nearbyRef.current.forEach((employee) => {
@@ -534,7 +492,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
   function leaveVoice() {
     voiceEnabledRef.current = false;
 
-    // Notify peers before closing the current connections.
     for (const peerId of peerConnectionsRef.current.keys()) {
       if (socket.connected) {
         socket.emit("voiceSignal", {
@@ -651,10 +608,227 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
   return (
     <main className="app">
+      <style>{`
+        .avatar-voice-wrapper {
+          position: relative;
+          width: 48px;
+          height: 48px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          isolation: isolate;
+          z-index: 1;
+        }
+
+        .voice-range-circle {
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: var(--voice-range-size);
+          height: var(--voice-range-size);
+          transform: translate(-50%, -50%);
+          border: 1.5px solid rgba(45, 210, 255, 0.65);
+          border-radius: 50%;
+          background:
+            radial-gradient(
+              circle,
+              rgba(0, 190, 255, 0.02) 35%,
+              rgba(0, 150, 255, 0.045) 70%,
+              rgba(0, 210, 255, 0.10) 100%
+            );
+          box-shadow:
+            0 0 12px rgba(0, 180, 255, 0.16),
+            0 0 28px rgba(0, 160, 255, 0.10),
+            inset 0 0 22px rgba(0, 190, 255, 0.08);
+          pointer-events: none;
+          z-index: 0;
+          animation: oceanBoundary 5s ease-in-out infinite;
+        }
+
+        .voice-range-circle::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          border: 2px solid rgba(0, 210, 255, 0.55);
+          border-radius: 48% 52% 55% 45% / 52% 45% 55% 48%;
+          background: transparent;
+          box-shadow:
+            0 0 12px rgba(0, 190, 255, 0.22),
+            inset 0 0 12px rgba(0, 190, 255, 0.06);
+          animation: oceanWaveOne 7s ease-in-out infinite;
+        }
+
+        .voice-range-circle::after {
+          content: "";
+          position: absolute;
+          inset: 5px;
+          border: 1.5px solid rgba(40, 150, 255, 0.48);
+          border-radius: 55% 45% 48% 52% / 45% 55% 45% 55%;
+          background:
+            radial-gradient(
+              circle,
+              transparent 65%,
+              rgba(0, 190, 255, 0.035) 100%
+            );
+          animation: oceanWaveTwo 9s ease-in-out infinite;
+        }
+
+        .ocean-wave {
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: var(--voice-range-size);
+          height: var(--voice-range-size);
+          border: 1px solid rgba(0, 200, 255, 0.38);
+          border-radius: 50%;
+          transform: translate(-50%, -50%);
+          pointer-events: none;
+          z-index: 0;
+        }
+
+        .ocean-wave.wave-one {
+          animation: sonarWave 4s ease-out infinite;
+        }
+
+        .ocean-wave.wave-two {
+          animation: sonarWave 4s ease-out infinite 1.3s;
+          border-color: rgba(30, 145, 255, 0.42);
+        }
+
+        .ocean-wave.wave-three {
+          animation: sonarWave 4s ease-out infinite 2.6s;
+          border-color: rgba(0, 220, 255, 0.32);
+        }
+
+        .ocean-glow {
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          width: var(--voice-range-size);
+          height: var(--voice-range-size);
+          transform: translate(-50%, -50%);
+          border-radius: 50%;
+          background: conic-gradient(
+            from 0deg,
+            transparent 0deg,
+            rgba(0, 210, 255, 0.08) 45deg,
+            transparent 100deg,
+            rgba(30, 100, 255, 0.06) 180deg,
+            transparent 240deg,
+            rgba(0, 210, 255, 0.07) 300deg,
+            transparent 360deg
+          );
+          filter: blur(5px);
+          animation: oceanRotate 14s linear infinite;
+          pointer-events: none;
+          z-index: 0;
+        }
+
+        .avatar-voice-wrapper .avatar {
+          position: relative;
+          z-index: 2;
+          box-shadow:
+            0 0 0 2px rgba(0, 210, 255, 0.18),
+            0 0 12px rgba(0, 180, 255, 0.18);
+        }
+
+        @keyframes oceanBoundary {
+          0%, 100% {
+            opacity: 0.65;
+            border-color: rgba(45, 210, 255, 0.45);
+            box-shadow:
+              0 0 10px rgba(0, 180, 255, 0.12),
+              inset 0 0 15px rgba(0, 190, 255, 0.04);
+          }
+
+          50% {
+            opacity: 1;
+            border-color: rgba(0, 225, 255, 0.85);
+            box-shadow:
+              0 0 20px rgba(0, 200, 255, 0.24),
+              0 0 35px rgba(0, 150, 255, 0.12),
+              inset 0 0 25px rgba(0, 190, 255, 0.12);
+          }
+        }
+
+        @keyframes oceanWaveOne {
+          0%, 100% {
+            border-radius: 48% 52% 55% 45% / 52% 45% 55% 48%;
+            transform: scale(0.98) rotate(0deg);
+          }
+
+          25% {
+            border-radius: 55% 45% 48% 52% / 45% 55% 48% 52%;
+            transform: scale(1.005) rotate(4deg);
+          }
+
+          50% {
+            border-radius: 45% 55% 52% 48% / 55% 45% 52% 48%;
+            transform: scale(0.99) rotate(8deg);
+          }
+
+          75% {
+            border-radius: 52% 48% 45% 55% / 48% 52% 55% 45%;
+            transform: scale(1.01) rotate(4deg);
+          }
+        }
+
+        @keyframes oceanWaveTwo {
+          0%, 100% {
+            border-radius: 55% 45% 48% 52% / 45% 55% 45% 55%;
+            transform: scale(0.96) rotate(0deg);
+            opacity: 0.4;
+          }
+
+          50% {
+            border-radius: 45% 55% 55% 45% / 55% 45% 52% 48%;
+            transform: scale(1.025) rotate(-10deg);
+            opacity: 0.85;
+          }
+        }
+
+        @keyframes sonarWave {
+          0% {
+            transform: translate(-50%, -50%) scale(0.94);
+            opacity: 0.65;
+          }
+
+          70% {
+            opacity: 0.2;
+          }
+
+          100% {
+            transform: translate(-50%, -50%) scale(1.045);
+            opacity: 0;
+          }
+        }
+
+        @keyframes oceanRotate {
+          from {
+            transform: translate(-50%, -50%) rotate(0deg);
+          }
+
+          to {
+            transform: translate(-50%, -50%) rotate(360deg);
+          }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .voice-range-circle,
+          .voice-range-circle::before,
+          .voice-range-circle::after,
+          .ocean-wave,
+          .ocean-glow {
+            animation: none !important;
+          }
+        }
+      `}</style>
+
       <Header
         user={user}
         onNavigate={onNavigate}
         onLogout={onLogout}
+        currentPage="VirtualOffice"
       />
 
       <section className="office-stage">
@@ -689,17 +863,55 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
                   top: `${6.5 + (employee.y / 500) * 86}%`,
                 }}
               >
-                <div
-                  className={`avatar ${
-                    isMe ? "my-avatar" : "other-avatar"
-                  }`}
-                  title={
-                    isNearby
-                      ? `${employee.name} — nearby`
-                      : employee.name
-                  }
-                >
-                  {initials}
+                <div className="avatar-voice-wrapper">
+                  <div
+                    className="voice-range-circle"
+                    style={{
+                      "--voice-range-size": `${voiceRange * 2}px`,
+                    }}
+                    title={`Voice range: ${voiceRange}px`}
+                  />
+
+                  <div
+                    className="ocean-wave wave-one"
+                    style={{
+                      "--voice-range-size": `${voiceRange * 2}px`,
+                    }}
+                  />
+
+                  <div
+                    className="ocean-wave wave-two"
+                    style={{
+                      "--voice-range-size": `${voiceRange * 2}px`,
+                    }}
+                  />
+
+                  <div
+                    className="ocean-wave wave-three"
+                    style={{
+                      "--voice-range-size": `${voiceRange * 2}px`,
+                    }}
+                  />
+
+                  <div
+                    className="ocean-glow"
+                    style={{
+                      "--voice-range-size": `${voiceRange * 2}px`,
+                    }}
+                  />
+
+                  <div
+                    className={`avatar ${
+                      isMe ? "my-avatar" : "other-avatar"
+                    }`}
+                    title={
+                      isNearby
+                        ? `${employee.name} — nearby`
+                        : employee.name
+                    }
+                  >
+                    {initials}
+                  </div>
                 </div>
 
                 <span className="player-name">
@@ -777,7 +989,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
           </span>
         )}
 
-        {/* Remote audio elements */}
         {Object.entries(remoteStreams).map(([peerId, stream]) => (
           <audio
             key={peerId}
@@ -797,36 +1008,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
           />
         ))}
       </section>
-
-      {/* Existing connection and spatial status */}
-      <footer className="app-footer">
-        <span
-          className={
-            connected ? "connection-online" : "connection-offline"
-          }
-        >
-          ● {connected ? "Connected" : "Connecting..."}
-        </span>
-
-        <span>Employees online: {employees.length}</span>
-
-        <span>Nearby: {nearbyEmployees.length}</span>
-
-        <span>
-          {nearbyEmployees.length > 0
-            ? nearbyEmployees
-                .map(
-                  (employee) =>
-                    `${employee.name} (${employee.distance}px)`
-                )
-                .join(", ")
-            : "No nearby employees"}
-        </span>
-
-        <span>Voice range: {voiceRange}px</span>
-
-        <span>Move: W A S D or arrow keys</span>
-      </footer>
     </main>
   );
 }

@@ -1,4 +1,3 @@
-
 import { useState, useEffect } from "react";
 
 import Login from "./pages/Login";
@@ -10,11 +9,20 @@ import Meetings from "./pages/Meetings";
 import Chat from "./pages/Chat";
 import Settings from "./pages/Settings";
 
+import socket from "./socket";
+import AppStatusContext from "./AppStatusContext";
+
 function App() {
   const [user, setUser] = useState(null);
   const [currentPage, setCurrentPage] = useState("VirtualOffice");
 
-  // Keep browser history synchronized with the current page.
+  // Global live application status.
+  const [connected, setConnected] = useState(false);
+  const [employees, setEmployees] = useState([]);
+  const [nearbyEmployees, setNearbyEmployees] = useState([]);
+  const [voiceRange, setVoiceRange] = useState(120);
+
+  // Keep browser history synchronized.
   useEffect(() => {
     window.history.replaceState(
       { page: "VirtualOffice" },
@@ -23,13 +31,7 @@ function App() {
     );
 
     function handlePopState(event) {
-      const page = event.state?.page;
-
-      if (page) {
-        setCurrentPage(page);
-      } else {
-        setCurrentPage("VirtualOffice");
-      }
+      setCurrentPage(event.state?.page || "VirtualOffice");
     }
 
     window.addEventListener("popstate", handlePopState);
@@ -39,14 +41,98 @@ function App() {
     };
   }, []);
 
+  // One Socket.IO connection for the entire logged-in session.
+  useEffect(() => {
+    if (!user) {
+      socket.disconnect();
+      setConnected(false);
+      setEmployees([]);
+      setNearbyEmployees([]);
+      return;
+    }
+
+    socket.auth = {
+      userId:
+        user?.username ||
+        user?.userId ||
+        user?.id ||
+        user?.name ||
+        "guest",
+      name: user?.name || user?.username || "Guest",
+    };
+
+    function handleConnect() {
+      setConnected(true);
+    }
+
+    function handleDisconnect() {
+      setConnected(false);
+      setEmployees([]);
+      setNearbyEmployees([]);
+    }
+
+    function handleEmployeesUpdate(updatedEmployees) {
+      setEmployees(updatedEmployees || []);
+    }
+
+    function handleProximityUpdate(data = {}) {
+      setNearbyEmployees(data.nearbyEmployees || []);
+
+      if (Number.isFinite(data.voiceRange)) {
+        setVoiceRange(data.voiceRange);
+      }
+    }
+
+    function handleConnectError(error) {
+      console.error("Socket connection error:", error.message);
+      setConnected(false);
+    }
+
+    socket.on("connect", handleConnect);
+    socket.on("disconnect", handleDisconnect);
+    socket.on("employeesUpdate", handleEmployeesUpdate);
+    socket.on("proximityUpdate", handleProximityUpdate);
+    socket.on("connect_error", handleConnectError);
+
+    if (socket.connected) {
+      handleConnect();
+    } else {
+      socket.connect();
+    }
+
+    return () => {
+      socket.off("connect", handleConnect);
+      socket.off("disconnect", handleDisconnect);
+      socket.off("employeesUpdate", handleEmployeesUpdate);
+      socket.off("proximityUpdate", handleProximityUpdate);
+      socket.off("connect_error", handleConnectError);
+
+      // Disconnect only when the logged-in user/session changes,
+      // not when navigating between application pages.
+      socket.disconnect();
+    };
+  }, [
+    user?.name,
+    user?.username,
+    user?.userId,
+    user?.id,
+  ]);
+
   function handleLogin(userData) {
     setUser(userData);
     setCurrentPage("VirtualOffice");
+
+    window.history.replaceState(
+      { page: "VirtualOffice" },
+      "",
+      window.location.pathname
+    );
   }
 
   function handleLogout() {
     setUser(null);
     setCurrentPage("VirtualOffice");
+
     window.history.replaceState(null, "", "/");
   }
 
@@ -68,27 +154,61 @@ function App() {
 
   const pageProps = {
     user,
+    currentPage,
     onNavigate: handleNavigate,
     onLogout: handleLogout,
     onBack: () => handleNavigate("VirtualOffice"),
+
+    // Shared live employee information.
+    onlineEmployees: employees,
+    connected,
   };
+
+  let currentPageComponent;
 
   switch (currentPage) {
     case "Profile":
-      return <Profile {...pageProps} />;
+      currentPageComponent = <Profile {...pageProps} />;
+      break;
+
     case "People":
-      return <People {...pageProps} />;
+      currentPageComponent = <People {...pageProps} />;
+      break;
+
     case "MyTeam":
-      return <MyTeam {...pageProps} />;
+      currentPageComponent = <MyTeam {...pageProps} />;
+      break;
+
     case "Meetings":
-      return <Meetings {...pageProps} />;
+      currentPageComponent = <Meetings {...pageProps} />;
+      break;
+
     case "Chat":
-      return <Chat {...pageProps} />;
+      currentPageComponent = <Chat {...pageProps} />;
+      break;
+
     case "Settings":
-      return <Settings {...pageProps} />;
+      currentPageComponent = <Settings {...pageProps} />;
+      break;
+
+    case "VirtualOffice":
     default:
-      return <VirtualOffice {...pageProps} />;
+      currentPageComponent = <VirtualOffice {...pageProps} />;
+      break;
   }
+
+  return (
+    <AppStatusContext.Provider
+      value={{
+        connected,
+        employees,
+        nearbyEmployees,
+        voiceRange,
+      }}
+    >
+      {currentPageComponent}
+    </AppStatusContext.Provider>
+  );
 }
 
 export default App;

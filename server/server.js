@@ -38,8 +38,15 @@ const VOICE_RANGE = 120;
 const TARGET_QUERY_TIME_MS = 20;
 const CLUSTER_DISTANCE_PIXELS = 100;
 
-// Current positions of connected Socket.IO sessions.
+// Minimum center-to-center distance between avatars.
+const COLLISION_DISTANCE = 20;
+
+// Currently connected Socket.IO sessions.
 const employees = new Map();
+
+// Preserve positions across reconnections.
+// Key: userId, Value: { x, y }
+const employeePositions = new Map();
 
 // ==========================================
 // DISTANCE HELPERS
@@ -59,6 +66,180 @@ function distanceBetweenEmployees(employee1, employee2) {
 }
 
 // ==========================================
+// COLLISION DETECTION
+// ==========================================
+
+function isPositionAvailable(x, y, excludeSocketId = null) {
+  for (const employee of employees.values()) {
+    if (employee.socketId === excludeSocketId) {
+      continue;
+    }
+
+    const distance = distanceInPixels(
+      x,
+      y,
+      employee.x,
+      employee.y
+    );
+
+    if (distance < COLLISION_DISTANCE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// ==========================================
+// FIND A FREE SPAWN POSITION
+// ==========================================
+
+function findFreePosition(preferredX, preferredY) {
+  const x = Math.max(30, Math.min(OFFICE_WIDTH - 30, preferredX));
+  const y = Math.max(30, Math.min(OFFICE_HEIGHT - 30, preferredY));
+
+  // Use the saved position if it is available.
+  if (isPositionAvailable(x, y)) {
+    return { x, y };
+  }
+
+  // Search outward around the preferred position.
+  const step = COLLISION_DISTANCE + 5;
+
+  for (let radius = step; radius <= 500; radius += step) {
+    for (let angle = 0; angle < 360; angle += 22.5) {
+      const radians = (angle * Math.PI) / 180;
+
+      const candidateX = Math.max(
+        30,
+        Math.min(
+          OFFICE_WIDTH - 30,
+          x + Math.cos(radians) * radius
+        )
+      );
+
+      const candidateY = Math.max(
+        30,
+        Math.min(
+          OFFICE_HEIGHT - 30,
+          y + Math.sin(radians) * radius
+        )
+      );
+
+      if (isPositionAvailable(candidateX, candidateY)) {
+        return {
+          x: candidateX,
+          y: candidateY,
+        };
+      }
+    }
+  }
+
+  // Final fallback: scan the office in a grid.
+  for (let gridY = 30; gridY <= OFFICE_HEIGHT - 30; gridY += step) {
+    for (let gridX = 30; gridX <= OFFICE_WIDTH - 30; gridX += step) {
+      if (isPositionAvailable(gridX, gridY)) {
+        return {
+          x: gridX,
+          y: gridY,
+        };
+      }
+    }
+  }
+
+  // The office is full.
+  return null;
+}
+
+// ==========================================
+// RESOLVE EMPLOYEE MOVEMENT
+// ==========================================
+
+function resolveMovement(employee, targetX, targetY) {
+  const currentX = employee.x;
+  const currentY = employee.y;
+
+  const nextX = Math.max(
+    30,
+    Math.min(OFFICE_WIDTH - 30, targetX)
+  );
+
+  const nextY = Math.max(
+    30,
+    Math.min(OFFICE_HEIGHT - 30, targetY)
+  );
+
+  // First try the complete movement.
+  if (
+    isPositionAvailable(
+      nextX,
+      nextY,
+      employee.socketId
+    )
+  ) {
+    return {
+      x: nextX,
+      y: nextY,
+    };
+  }
+
+  // If diagonal movement is blocked, try horizontal movement.
+  const horizontalAvailable = isPositionAvailable(
+    nextX,
+    currentY,
+    employee.socketId
+  );
+
+  // Try vertical movement.
+  const verticalAvailable = isPositionAvailable(
+    currentX,
+    nextY,
+    employee.socketId
+  );
+
+  // Prefer the direction with the larger requested movement.
+  if (
+    horizontalAvailable &&
+    verticalAvailable
+  ) {
+    if (
+      Math.abs(nextX - currentX) >=
+      Math.abs(nextY - currentY)
+    ) {
+      return {
+        x: nextX,
+        y: currentY,
+      };
+    }
+
+    return {
+      x: currentX,
+      y: nextY,
+    };
+  }
+
+  if (horizontalAvailable) {
+    return {
+      x: nextX,
+      y: currentY,
+    };
+  }
+
+  if (verticalAvailable) {
+    return {
+      x: currentX,
+      y: nextY,
+    };
+  }
+
+  // Both directions blocked.
+  return {
+    x: currentX,
+    y: currentY,
+  };
+}
+
+// ==========================================
 // HEALTH CHECK
 // ==========================================
 
@@ -72,7 +253,9 @@ app.get("/", (req, res) => {
       height: OFFICE_HEIGHT,
     },
     voiceRangePixels: VOICE_RANGE,
+    collisionDistancePixels: COLLISION_DISTANCE,
     connectedEmployees: employees.size,
+    cachedEmployeePositions: employeePositions.size,
   });
 });
 
@@ -252,6 +435,7 @@ app.get("/api/spatial-audit", (req, res) => {
       searchCenter: { x, y },
       radiusPixels: radius,
       clusterDistancePixels: CLUSTER_DISTANCE_PIXELS,
+      collisionDistancePixels: COLLISION_DISTANCE,
       totalConnectedEmployees: liveEmployees.length,
       nearbyCount: nearbyEmployees.length,
       nearbyEmployees,
@@ -281,7 +465,7 @@ app.get("/api/spatial-audit", (req, res) => {
 });
 
 // ==========================================
-// LIVE VIRTUAL OFFICE — BROADCAST STATE
+// BROADCAST EMPLOYEE STATE
 // ==========================================
 
 function broadcastEmployeeState() {
@@ -315,7 +499,7 @@ function broadcastEmployeeState() {
 }
 
 // ==========================================
-// LIVE VIRTUAL OFFICE — SOCKET CONNECTIONS
+// SOCKET CONNECTIONS
 // ==========================================
 
 io.on("connection", (socket) => {
@@ -331,22 +515,54 @@ io.on("connection", (socket) => {
       ? auth.name.trim()
       : "Guest";
 
+  // Restore previous position if available.
+  const savedPosition = employeePositions.get(userId);
+
+  const preferredX = savedPosition ? savedPosition.x : 400;
+  const preferredY = savedPosition ? savedPosition.y : 250;
+
+  // Find a free position for this employee.
+  const spawnPosition = findFreePosition(
+    preferredX,
+    preferredY
+  );
+
+  if (!spawnPosition) {
+    console.log(`Office full. Connection rejected: ${name}`);
+
+    socket.emit("officeFull", {
+      message: "The virtual office is currently full.",
+    });
+
+    socket.disconnect(true);
+    return;
+  }
+
   const employee = {
     socketId: socket.id,
     userId,
     name,
-    x: 400,
-    y: 250,
+    x: spawnPosition.x,
+    y: spawnPosition.y,
+    isVoiceActive: false,
+    isMuted: false,
   };
 
   employees.set(socket.id, employee);
 
-  console.log(`${name} connected (${socket.id})`);
+  employeePositions.set(userId, {
+    x: employee.x,
+    y: employee.y,
+  });
+
+  console.log(
+    `${name} connected (${socket.id}) at X:${employee.x}, Y:${employee.y}`
+  );
 
   broadcastEmployeeState();
 
   // ========================================
-  // EMPLOYEE MOVEMENT
+  // EMPLOYEE MOVEMENT WITH COLLISION CONTROL
   // ========================================
 
   socket.on("employeeMove", (movement) => {
@@ -354,32 +570,69 @@ io.on("connection", (socket) => {
 
     if (!currentEmployee || !movement) return;
 
-    const nextX = Number(movement.x);
-    const nextY = Number(movement.y);
+    const targetX = Number(movement.x);
+    const targetY = Number(movement.y);
 
-    if (!Number.isFinite(nextX) || !Number.isFinite(nextY)) {
+    if (
+      !Number.isFinite(targetX) ||
+      !Number.isFinite(targetY)
+    ) {
       return;
     }
 
-    currentEmployee.x = Math.max(
-      0,
-      Math.min(OFFICE_WIDTH, nextX)
+    // Server decides the final safe position.
+    const resolvedPosition = resolveMovement(
+      currentEmployee,
+      targetX,
+      targetY
     );
 
-    currentEmployee.y = Math.max(
-      0,
-      Math.min(OFFICE_HEIGHT, nextY)
-    );
+    currentEmployee.x = resolvedPosition.x;
+    currentEmployee.y = resolvedPosition.y;
 
     employees.set(socket.id, currentEmployee);
+
+    // Preserve the latest accepted position.
+    employeePositions.set(currentEmployee.userId, {
+      x: currentEmployee.x,
+      y: currentEmployee.y,
+    });
+
+    broadcastEmployeeState();
+  });
+
+  // ========================================
+  // VOICE STATUS TRACKING
+  // ========================================
+
+  socket.on("voiceStatus", (status = {}) => {
+    const currentEmployee = employees.get(socket.id);
+
+    if (!currentEmployee) return;
+
+    currentEmployee.isVoiceActive =
+      status.isVoiceActive === true;
+
+    currentEmployee.isMuted =
+      currentEmployee.isVoiceActive &&
+      status.isMuted === true;
+
+    employees.set(socket.id, currentEmployee);
+
+    console.log(
+      `${currentEmployee.name} voice status:`,
+      currentEmployee.isVoiceActive
+        ? currentEmployee.isMuted
+          ? "Muted"
+          : "Active"
+        : "Not in voice chat"
+    );
 
     broadcastEmployeeState();
   });
 
   // ========================================
   // WEBRTC VOICE SIGNALING
-  // Forwards offers, answers, and ICE candidates.
-  // Audio itself travels peer-to-peer.
   // ========================================
 
   socket.on("voiceSignal", (payload = {}) => {
@@ -394,7 +647,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Only relay signaling messages, not audio streams.
     io.to(targetSocketId).emit("voiceSignal", {
       fromSocketId: socket.id,
       signal,
@@ -410,8 +662,11 @@ io.on("connection", (socket) => {
 
     employees.delete(socket.id);
 
+    // Keep employeePositions intact.
+    // This preserves positions across reconnections.
+
     console.log(
-      `${disconnectedEmployee?.name || "Employee"} disconnected`
+      `${disconnectedEmployee?.name || "Employee"} disconnected. Position preserved.`
     );
 
     broadcastEmployeeState();
@@ -464,8 +719,12 @@ async function startServer() {
       );
 
       console.log(`Voice range: ${VOICE_RANGE} pixels`);
+      console.log(`Collision distance: ${COLLISION_DISTANCE} pixels`);
       console.log("Spatial audit source: live connected employees");
       console.log("WebRTC signaling: enabled");
+      console.log("Live voice status tracking: enabled");
+      console.log("Employee position restoration: enabled");
+      console.log("Avatar collision detection: enabled");
     });
   } catch (error) {
     console.error("Server startup failed:", error);
