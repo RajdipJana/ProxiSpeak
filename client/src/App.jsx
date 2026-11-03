@@ -41,27 +41,26 @@ function App() {
     };
   }, []);
 
-  // One Socket.IO connection for the entire logged-in session.
+  // One authenticated Socket.IO connection for the logged-in session.
   useEffect(() => {
-    if (!user) {
+    if (!user || !user.token) {
       socket.disconnect();
+
       setConnected(false);
       setEmployees([]);
       setNearbyEmployees([]);
+
       return;
     }
 
+    // Send JWT token to the backend for authentication.
     socket.auth = {
-      userId:
-        user?.username ||
-        user?.userId ||
-        user?.id ||
-        user?.name ||
-        "guest",
-      name: user?.name || user?.username || "Guest",
+      token: user.token,
     };
 
     function handleConnect() {
+      console.log("Authenticated Socket.IO connection established.");
+
       setConnected(true);
     }
 
@@ -85,6 +84,7 @@ function App() {
 
     function handleConnectError(error) {
       console.error("Socket connection error:", error.message);
+
       setConnected(false);
     }
 
@@ -107,17 +107,13 @@ function App() {
       socket.off("proximityUpdate", handleProximityUpdate);
       socket.off("connect_error", handleConnectError);
 
-      // Disconnect only when the logged-in user/session changes,
+      // Disconnect only when the logged-in session changes,
       // not when navigating between application pages.
       socket.disconnect();
     };
-  }, [
-    user?.name,
-    user?.username,
-    user?.userId,
-    user?.id,
-  ]);
+  }, [user]);
 
+  // Handle successful login.
   function handleLogin(userData) {
     setUser(userData);
     setCurrentPage("VirtualOffice");
@@ -129,13 +125,21 @@ function App() {
     );
   }
 
+  // Handle logout.
   function handleLogout() {
+    socket.disconnect();
+
     setUser(null);
     setCurrentPage("VirtualOffice");
+
+    setConnected(false);
+    setEmployees([]);
+    setNearbyEmployees([]);
 
     window.history.replaceState(null, "", "/");
   }
 
+  // Handle application navigation.
   function handleNavigate(page) {
     if (page === currentPage) return;
 
@@ -148,6 +152,7 @@ function App() {
     setCurrentPage(page);
   }
 
+  // Show login page when no user is authenticated.
   if (!user) {
     return <Login onLogin={handleLogin} />;
   }

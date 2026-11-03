@@ -1,47 +1,52 @@
-
 import { useState } from "react";
 import "./Login.css";
 
-// Demo employee accounts
-const employees = {
-  rajdip: {
-    name: "Rajdip Jana",
-    username: "rajdip",
-  },
-  dona: {
-    name: "Dona Mondal",
-    username: "dona",
-  },
-  rithvik: {
-    name: "Rithvik kolipaka",
-    username: "rithvik",
-  },
-
-  abdul: {
-    name: "Abdul Muhyee",
-    username: "abdul",
-  },
-  
-};
-
-const COMMON_PASSWORD = "123456";
+const API_URL = "http://localhost:5000";
 
 function Login({ onLogin }) {
-  const [username, setUsername] = useState("");
+  const [employeeId, setEmployeeId] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
+
     setError("");
+    setLoading(true);
 
-    const loginId = username.trim().toLowerCase();
-    const employee = employees[loginId];
+    try {
+      const response = await fetch(`${API_URL}/api/auth/login`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          employeeId: employeeId.trim().toUpperCase(),
+          password,
+        }),
+      });
 
-    if (employee && password === COMMON_PASSWORD) {
-      onLogin(employee);
-    } else {
-      setError("Invalid login ID or password. Please try again.");
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        setError(data.message || "Invalid employee ID or password.");
+        return;
+      }
+
+      // Pass employee information and JWT token to App.jsx
+      onLogin({
+        ...data.user,
+        token: data.token,
+      });
+    } catch (err) {
+      console.error("Login error:", err);
+
+      setError(
+        "Unable to connect to the server. Please make sure ProxiSpeak's backend is running."
+      );
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -60,18 +65,20 @@ function Login({ onLogin }) {
         </div>
 
         <form className="login-form" onSubmit={handleSubmit}>
-          <label htmlFor="username">Employee Login ID</label>
+          <label htmlFor="employeeId">Employee ID</label>
+
           <input
-            id="username"
+            id="employeeId"
             type="text"
-            placeholder="Enter your login ID"
-            value={username}
-            onChange={(event) => setUsername(event.target.value)}
+            placeholder="Enter your employee ID (e.g. PS-001)"
+            value={employeeId}
+            onChange={(event) => setEmployeeId(event.target.value)}
             autoComplete="username"
             required
           />
 
           <label htmlFor="password">Password</label>
+
           <input
             id="password"
             type="password"
@@ -88,17 +95,24 @@ function Login({ onLogin }) {
             </p>
           )}
 
-          <button className="login-button" type="submit">
-            Sign In <span aria-hidden="true">→</span>
+          <button
+            className="login-button"
+            type="submit"
+            disabled={loading}
+          >
+            {loading ? "Signing In..." : "Sign In"}
+            {!loading && <span aria-hidden="true">→</span>}
           </button>
         </form>
 
         <div className="login-demo">
-          <p>Demo Login Credentials</p>
-          <span>Rajdip: rajdip</span>
-          <span>Dona: dona</span>
-          <span>Rithvik: rithvik</span>
-          <span>Abdul: abdul</span>
+          <p>Demo Employee Accounts</p>
+
+          <span>Dona Mondal: PS-001</span>
+          <span>Rajdip Jana: PS-002</span>
+          <span>Rithvik kolipaka: PS-003</span>
+          <span>Abdul Muhyee: PS-004</span>
+
           <span>Password for all: 123456</span>
         </div>
 

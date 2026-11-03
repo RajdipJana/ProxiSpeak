@@ -1,13 +1,15 @@
-
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const mongoose = require("mongoose");
+const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 const { performance } = require("node:perf_hooks");
 
 const UserLocation = require("./models/UserLocation");
+const Employee = require("./models/Employee");
+const authRoutes = require("./routes/authRoutes");
 
 dotenv.config();
 mongoose.set("autoIndex", false);
@@ -17,6 +19,16 @@ const server = http.createServer(app);
 
 app.use(cors());
 app.use(express.json());
+
+// ==========================================
+// AUTHENTICATION ROUTES
+// ==========================================
+
+app.use("/api/auth", authRoutes);
+
+// ==========================================
+// SOCKET.IO CONFIGURATION
+// ==========================================
 
 const io = new Server(server, {
   cors: {
@@ -38,15 +50,63 @@ const VOICE_RANGE = 120;
 const TARGET_QUERY_TIME_MS = 20;
 const CLUSTER_DISTANCE_PIXELS = 100;
 
-// Minimum center-to-center distance between avatars.
 const COLLISION_DISTANCE = 20;
 
 // Currently connected Socket.IO sessions.
 const employees = new Map();
 
 // Preserve positions across reconnections.
-// Key: userId, Value: { x, y }
+// Key: employeeId, Value: { x, y }
 const employeePositions = new Map();
+
+// ==========================================
+// SOCKET JWT AUTHENTICATION
+// ==========================================
+
+// Every Socket.IO connection must have a valid JWT.
+// Employee identity is loaded from MongoDB.
+
+io.use(async (socket, next) => {
+  try {
+    const auth = socket.handshake.auth || {};
+    const token = auth.token;
+
+    if (typeof token !== "string" || !token.trim()) {
+      return next(new Error("Authentication required. Please log in."));
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    if (!decoded.id) {
+      return next(new Error("Invalid authentication token."));
+    }
+
+    const employee = await Employee.findById(decoded.id).select(
+      "employeeId name role department isActive"
+    );
+
+    if (!employee || !employee.isActive) {
+      return next(
+        new Error("Employee account not found or inactive.")
+      );
+    }
+
+    // Store trusted database identity on this socket.
+    socket.data.employee = {
+      id: employee._id.toString(),
+      userId: employee.employeeId,
+      name: employee.name,
+      role: employee.role,
+      department: employee.department,
+    };
+
+    next();
+  } catch (error) {
+    console.error("Socket authentication failed:", error.message);
+
+    next(new Error("Invalid or expired login session. Please log in again."));
+  }
+});
 
 // ==========================================
 // DISTANCE HELPERS
@@ -98,12 +158,10 @@ function findFreePosition(preferredX, preferredY) {
   const x = Math.max(30, Math.min(OFFICE_WIDTH - 30, preferredX));
   const y = Math.max(30, Math.min(OFFICE_HEIGHT - 30, preferredY));
 
-  // Use the saved position if it is available.
   if (isPositionAvailable(x, y)) {
     return { x, y };
   }
 
-  // Search outward around the preferred position.
   const step = COLLISION_DISTANCE + 5;
 
   for (let radius = step; radius <= 500; radius += step) {
@@ -147,7 +205,6 @@ function findFreePosition(preferredX, preferredY) {
     }
   }
 
-  // The office is full.
   return null;
 }
 
@@ -183,25 +240,19 @@ function resolveMovement(employee, targetX, targetY) {
     };
   }
 
-  // If diagonal movement is blocked, try horizontal movement.
   const horizontalAvailable = isPositionAvailable(
     nextX,
     currentY,
     employee.socketId
   );
 
-  // Try vertical movement.
   const verticalAvailable = isPositionAvailable(
     currentX,
     nextY,
     employee.socketId
   );
 
-  // Prefer the direction with the larger requested movement.
-  if (
-    horizontalAvailable &&
-    verticalAvailable
-  ) {
+  if (horizontalAvailable && verticalAvailable) {
     if (
       Math.abs(nextX - currentX) >=
       Math.abs(nextY - currentY)
@@ -232,7 +283,6 @@ function resolveMovement(employee, targetX, targetY) {
     };
   }
 
-  // Both directions blocked.
   return {
     x: currentX,
     y: currentY,
@@ -503,17 +553,13 @@ function broadcastEmployeeState() {
 // ==========================================
 
 io.on("connection", (socket) => {
-  const auth = socket.handshake.auth || {};
+  // Identity comes from the authenticated MongoDB employee.
+  // Do not trust userId or name sent by the frontend.
 
-  const userId =
-    typeof auth.userId === "string" && auth.userId.trim()
-      ? auth.userId.trim()
-      : `guest-${socket.id}`;
+  const authenticatedEmployee = socket.data.employee;
 
-  const name =
-    typeof auth.name === "string" && auth.name.trim()
-      ? auth.name.trim()
-      : "Guest";
+  const userId = authenticatedEmployee.userId;
+  const name = authenticatedEmployee.name;
 
   // Restore previous position if available.
   const savedPosition = employeePositions.get(userId);
@@ -542,6 +588,8 @@ io.on("connection", (socket) => {
     socketId: socket.id,
     userId,
     name,
+    role: authenticatedEmployee.role,
+    department: authenticatedEmployee.department,
     x: spawnPosition.x,
     y: spawnPosition.y,
     isVoiceActive: false,
@@ -556,7 +604,7 @@ io.on("connection", (socket) => {
   });
 
   console.log(
-    `${name} connected (${socket.id}) at X:${employee.x}, Y:${employee.y}`
+    `${name} (${userId}) connected (${socket.id}) at X:${employee.x}, Y:${employee.y}`
   );
 
   broadcastEmployeeState();
@@ -580,7 +628,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Server decides the final safe position.
     const resolvedPosition = resolveMovement(
       currentEmployee,
       targetX,
@@ -592,7 +639,6 @@ io.on("connection", (socket) => {
 
     employees.set(socket.id, currentEmployee);
 
-    // Preserve the latest accepted position.
     employeePositions.set(currentEmployee.userId, {
       x: currentEmployee.x,
       y: currentEmployee.y,
@@ -685,6 +731,12 @@ async function startServer() {
       );
     }
 
+    if (!process.env.JWT_SECRET) {
+      throw new Error(
+        "JWT_SECRET is missing from server/.env"
+      );
+    }
+
     await mongoose.connect(process.env.MONGODB_URI);
 
     console.log("MongoDB Atlas connected successfully!");
@@ -720,6 +772,9 @@ async function startServer() {
 
       console.log(`Voice range: ${VOICE_RANGE} pixels`);
       console.log(`Collision distance: ${COLLISION_DISTANCE} pixels`);
+      console.log("JWT authentication: enabled");
+      console.log("Employee identity source: MongoDB");
+      console.log("Authentication API: /api/auth");
       console.log("Spatial audit source: live connected employees");
       console.log("WebRTC signaling: enabled");
       console.log("Live voice status tracking: enabled");
