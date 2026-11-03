@@ -52,6 +52,9 @@ const CLUSTER_DISTANCE_PIXELS = 100;
 
 const COLLISION_DISTANCE = 20;
 
+// Maximum chat message length.
+const MAX_CHAT_MESSAGE_LENGTH = 1000;
+
 // Currently connected Socket.IO sessions.
 const employees = new Map();
 
@@ -62,9 +65,6 @@ const employeePositions = new Map();
 // ==========================================
 // SOCKET JWT AUTHENTICATION
 // ==========================================
-
-// Every Socket.IO connection must have a valid JWT.
-// Employee identity is loaded from MongoDB.
 
 io.use(async (socket, next) => {
   try {
@@ -91,7 +91,6 @@ io.use(async (socket, next) => {
       );
     }
 
-    // Store trusted database identity on this socket.
     socket.data.employee = {
       id: employee._id.toString(),
       userId: employee.employeeId,
@@ -226,7 +225,6 @@ function resolveMovement(employee, targetX, targetY) {
     Math.min(OFFICE_HEIGHT - 30, targetY)
   );
 
-  // First try the complete movement.
   if (
     isPositionAvailable(
       nextX,
@@ -306,6 +304,8 @@ app.get("/", (req, res) => {
     collisionDistancePixels: COLLISION_DISTANCE,
     connectedEmployees: employees.size,
     cachedEmployeePositions: employeePositions.size,
+    chatEnabled: true,
+    chatStorage: "Temporary frontend state only",
   });
 });
 
@@ -553,9 +553,6 @@ function broadcastEmployeeState() {
 // ==========================================
 
 io.on("connection", (socket) => {
-  // Identity comes from the authenticated MongoDB employee.
-  // Do not trust userId or name sent by the frontend.
-
   const authenticatedEmployee = socket.data.employee;
 
   const userId = authenticatedEmployee.userId;
@@ -645,6 +642,56 @@ io.on("connection", (socket) => {
     });
 
     broadcastEmployeeState();
+  });
+
+  // ========================================
+  // REAL-TIME OFFICE CHAT
+  // ========================================
+
+  socket.on("sendMessage", (payload = {}) => {
+    const currentEmployee = employees.get(socket.id);
+
+    if (!currentEmployee) return;
+
+    // Accept only plain text messages.
+    const messageText =
+      typeof payload.message === "string"
+        ? payload.message.trim()
+        : "";
+
+    // Reject empty messages.
+    if (!messageText) {
+      socket.emit("chatError", {
+        message: "Message cannot be empty.",
+      });
+
+      return;
+    }
+
+    // Enforce message length.
+    if (messageText.length > MAX_CHAT_MESSAGE_LENGTH) {
+      socket.emit("chatError", {
+        message: `Messages cannot exceed ${MAX_CHAT_MESSAGE_LENGTH} characters.`,
+      });
+
+      return;
+    }
+
+    // Sender identity is taken from the authenticated employee.
+    const chatMessage = {
+      id: `${Date.now()}-${socket.id}`,
+      senderId: currentEmployee.userId,
+      senderName: currentEmployee.name,
+      message: messageText,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Broadcast to every currently connected office employee.
+    io.emit("newMessage", chatMessage);
+
+    console.log(
+      `[Office Chat] ${currentEmployee.name} (${currentEmployee.userId}): ${messageText}`
+    );
   });
 
   // ========================================
@@ -780,6 +827,8 @@ async function startServer() {
       console.log("Live voice status tracking: enabled");
       console.log("Employee position restoration: enabled");
       console.log("Avatar collision detection: enabled");
+      console.log("Real-time office chat: enabled");
+      console.log("Chat message storage: disabled (temporary)");
     });
   } catch (error) {
     console.error("Server startup failed:", error);

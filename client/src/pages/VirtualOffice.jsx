@@ -1,4 +1,3 @@
-
 import Header from "../components/Header";
 import {
   useState,
@@ -10,6 +9,7 @@ import {
 import socket from "../socket";
 import AppStatusContext from "../AppStatusContext";
 import "../App.css";
+import "./VirtualOffice.css";
 import officeFloor from "../assets/office-floor.png";
 
 // Public STUN server helps peers discover direct connection paths.
@@ -19,8 +19,13 @@ const RTC_CONFIG = {
   ],
 };
 
-function VirtualOffice({ user, onNavigate, onLogout }) {
-  // Shared application data — App.jsx manages the Socket.IO connection.
+function VirtualOffice({
+  user,
+  onNavigate,
+  onLogout,
+  isActive = true,
+  onVoiceControlsChange,
+}) {
   const {
     employees = [],
     connected = false,
@@ -73,6 +78,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
       const updated = { ...previous };
       delete updated[peerId];
+
       return updated;
     });
   }, []);
@@ -155,6 +161,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
     try {
       const offer = await pc.createOffer();
+
       await pc.setLocalDescription(offer);
 
       if (
@@ -174,7 +181,10 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       });
     } catch (error) {
       console.error("Could not start voice connection:", error);
-      setVoiceError("Could not connect to a nearby colleague.");
+
+      setVoiceError(
+        "Could not connect to a nearby colleague."
+      );
     } finally {
       offerInProgressRef.current.delete(peerId);
     }
@@ -194,6 +204,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       if (signal.type === "voice-left") {
         closePeerConnection(fromSocketId);
         announcedPeersRef.current.delete(fromSocketId);
+
         return;
       }
 
@@ -205,7 +216,9 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
         ) {
           socket.emit("voiceSignal", {
             targetSocketId: fromSocketId,
-            signal: { type: "voice-ready-ack" },
+            signal: {
+              type: "voice-ready-ack",
+            },
           });
 
           if (socket.id.localeCompare(fromSocketId) < 0) {
@@ -252,6 +265,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
           pendingCandidatesRef.current.delete(fromSocketId);
 
           const answer = await pc.createAnswer();
+
           await pc.setLocalDescription(answer);
 
           socket.emit("voiceSignal", {
@@ -286,11 +300,16 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
               pendingCandidatesRef.current.get(fromSocketId) || [];
 
             queued.push(candidate);
-            pendingCandidatesRef.current.set(fromSocketId, queued);
+
+            pendingCandidatesRef.current.set(
+              fromSocketId,
+              queued
+            );
           }
         }
       } catch (error) {
         console.error("WebRTC signaling error:", error);
+
         setVoiceError(
           "A voice connection failed. Try leaving and rejoining voice."
         );
@@ -302,7 +321,11 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
     return () => {
       socket.off("voiceSignal", handleVoiceSignal);
     };
-  }, [closePeerConnection, createPeerConnection, startOffer]);
+  }, [
+    closePeerConnection,
+    createPeerConnection,
+    startOffer,
+  ]);
 
   // ==========================================
   // SHARED SOCKET — OFFICE SESSION
@@ -317,6 +340,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       setMyEmployeeId("");
 
       voiceEnabledRef.current = false;
+
       setVoiceJoined(false);
       setMuted(false);
 
@@ -333,14 +357,13 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       announcedPeersRef.current.clear();
       pendingCandidatesRef.current.clear();
       offerInProgressRef.current.clear();
+
       setRemoteStreams({});
     }
 
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
 
-    // When returning from another page, the shared socket may
-    // already be connected. Set the current employee ID immediately.
     if (socket.connected) {
       handleConnect();
     }
@@ -349,8 +372,8 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
 
-      // Stop this page's voice resources, but DO NOT disconnect
-      // the shared Socket.IO connection managed by App.jsx.
+      // This cleanup happens when the persistent
+      // VirtualOffice component actually unmounts.
       voiceEnabledRef.current = false;
 
       localStreamRef.current?.getTracks().forEach((track) => {
@@ -409,7 +432,9 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
         socket.emit("voiceSignal", {
           targetSocketId: peerId,
-          signal: { type: "voice-ready" },
+          signal: {
+            type: "voice-ready",
+          },
         });
       });
     }
@@ -419,7 +444,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
   // JOIN VOICE
   // ==========================================
 
-  async function joinVoice() {
+  const joinVoice = useCallback(async () => {
     if (!socket.connected) {
       setVoiceError("Connect to the virtual office first.");
       return;
@@ -471,7 +496,9 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
         socket.emit("voiceSignal", {
           targetSocketId: peerId,
-          signal: { type: "voice-ready" },
+          signal: {
+            type: "voice-ready",
+          },
         });
       });
     } catch (error) {
@@ -483,20 +510,22 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
           : error.message || "Could not access the microphone."
       );
     }
-  }
+  }, []);
 
   // ==========================================
   // LEAVE VOICE
   // ==========================================
 
-  function leaveVoice() {
+  const leaveVoice = useCallback(() => {
     voiceEnabledRef.current = false;
 
     for (const peerId of peerConnectionsRef.current.keys()) {
       if (socket.connected) {
         socket.emit("voiceSignal", {
           targetSocketId: peerId,
-          signal: { type: "voice-left" },
+          signal: {
+            type: "voice-left",
+          },
         });
       }
     }
@@ -520,13 +549,13 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
     setVoiceJoined(false);
     setMuted(false);
     setVoiceError("");
-  }
+  }, []);
 
   // ==========================================
   // MUTE / UNMUTE
   // ==========================================
 
-  function toggleMute() {
+  const toggleMute = useCallback(() => {
     const stream = localStreamRef.current;
 
     if (!stream) return;
@@ -538,13 +567,44 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
     });
 
     setMuted(nextMuted);
-  }
+  }, [muted]);
+
+  // ==========================================
+  // SHARE VOICE CONTROLS WITH APP.JSX
+  // ==========================================
+
+  useEffect(() => {
+    onVoiceControlsChange?.({
+      voiceJoined,
+      muted,
+      voiceError,
+      audioConnections: Object.keys(remoteStreams).length,
+      voiceDisabled: !connected,
+
+      onJoinVoice: joinVoice,
+      onToggleMute: toggleMute,
+      onLeaveVoice: leaveVoice,
+    });
+  }, [
+    onVoiceControlsChange,
+    voiceJoined,
+    muted,
+    voiceError,
+    remoteStreams,
+    connected,
+    joinVoice,
+    toggleMute,
+    leaveVoice,
+  ]);
 
   // ==========================================
   // KEYBOARD MOVEMENT
   // ==========================================
 
   useEffect(() => {
+    // Do not allow office movement from other pages.
+    if (!isActive) return;
+
     function handleKeyDown(event) {
       const key = event.key.toLowerCase();
 
@@ -582,6 +642,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
       event.preventDefault();
 
       const speed = 12;
+
       let { x, y } = currentEmployee;
 
       if (key === "w" || key === "arrowup") y -= speed;
@@ -600,7 +661,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [employees, myEmployeeId]);
+  }, [employees, myEmployeeId, isActive]);
 
   // ==========================================
   // VIRTUAL OFFICE UI
@@ -608,222 +669,6 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
 
   return (
     <main className="app">
-      <style>{`
-        .avatar-voice-wrapper {
-          position: relative;
-          width: 48px;
-          height: 48px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          isolation: isolate;
-          z-index: 1;
-        }
-
-        .voice-range-circle {
-          position: absolute;
-          top: 50%;
-          left: 50%;
-          width: var(--voice-range-size);
-          height: var(--voice-range-size);
-          transform: translate(-50%, -50%);
-          border: 1.5px solid rgba(45, 210, 255, 0.65);
-          border-radius: 50%;
-          background:
-            radial-gradient(
-              circle,
-              rgba(0, 190, 255, 0.02) 35%,
-              rgba(0, 150, 255, 0.045) 70%,
-              rgba(0, 210, 255, 0.10) 100%
-            );
-          box-shadow:
-            0 0 12px rgba(0, 180, 255, 0.16),
-            0 0 28px rgba(0, 160, 255, 0.10),
-            inset 0 0 22px rgba(0, 190, 255, 0.08);
-          pointer-events: none;
-          z-index: 0;
-          animation: oceanBoundary 5s ease-in-out infinite;
-        }
-
-        .voice-range-circle::before {
-          content: "";
-          position: absolute;
-          inset: 0;
-          border: 2px solid rgba(0, 210, 255, 0.55);
-          border-radius: 48% 52% 55% 45% / 52% 45% 55% 48%;
-          background: transparent;
-          box-shadow:
-            0 0 12px rgba(0, 190, 255, 0.22),
-            inset 0 0 12px rgba(0, 190, 255, 0.06);
-          animation: oceanWaveOne 7s ease-in-out infinite;
-        }
-
-        .voice-range-circle::after {
-          content: "";
-          position: absolute;
-          inset: 5px;
-          border: 1.5px solid rgba(40, 150, 255, 0.48);
-          border-radius: 55% 45% 48% 52% / 45% 55% 45% 55%;
-          background:
-            radial-gradient(
-              circle,
-              transparent 65%,
-              rgba(0, 190, 255, 0.035) 100%
-            );
-          animation: oceanWaveTwo 9s ease-in-out infinite;
-        }
-
-        .ocean-wave {
-          position: absolute;
-          top: 50%;
-          left: 50%;
-          width: var(--voice-range-size);
-          height: var(--voice-range-size);
-          border: 1px solid rgba(0, 200, 255, 0.38);
-          border-radius: 50%;
-          transform: translate(-50%, -50%);
-          pointer-events: none;
-          z-index: 0;
-        }
-
-        .ocean-wave.wave-one {
-          animation: sonarWave 4s ease-out infinite;
-        }
-
-        .ocean-wave.wave-two {
-          animation: sonarWave 4s ease-out infinite 1.3s;
-          border-color: rgba(30, 145, 255, 0.42);
-        }
-
-        .ocean-wave.wave-three {
-          animation: sonarWave 4s ease-out infinite 2.6s;
-          border-color: rgba(0, 220, 255, 0.32);
-        }
-
-        .ocean-glow {
-          position: absolute;
-          top: 50%;
-          left: 50%;
-          width: var(--voice-range-size);
-          height: var(--voice-range-size);
-          transform: translate(-50%, -50%);
-          border-radius: 50%;
-          background: conic-gradient(
-            from 0deg,
-            transparent 0deg,
-            rgba(0, 210, 255, 0.08) 45deg,
-            transparent 100deg,
-            rgba(30, 100, 255, 0.06) 180deg,
-            transparent 240deg,
-            rgba(0, 210, 255, 0.07) 300deg,
-            transparent 360deg
-          );
-          filter: blur(5px);
-          animation: oceanRotate 14s linear infinite;
-          pointer-events: none;
-          z-index: 0;
-        }
-
-        .avatar-voice-wrapper .avatar {
-          position: relative;
-          z-index: 2;
-          box-shadow:
-            0 0 0 2px rgba(0, 210, 255, 0.18),
-            0 0 12px rgba(0, 180, 255, 0.18);
-        }
-
-        @keyframes oceanBoundary {
-          0%, 100% {
-            opacity: 0.65;
-            border-color: rgba(45, 210, 255, 0.45);
-            box-shadow:
-              0 0 10px rgba(0, 180, 255, 0.12),
-              inset 0 0 15px rgba(0, 190, 255, 0.04);
-          }
-
-          50% {
-            opacity: 1;
-            border-color: rgba(0, 225, 255, 0.85);
-            box-shadow:
-              0 0 20px rgba(0, 200, 255, 0.24),
-              0 0 35px rgba(0, 150, 255, 0.12),
-              inset 0 0 25px rgba(0, 190, 255, 0.12);
-          }
-        }
-
-        @keyframes oceanWaveOne {
-          0%, 100% {
-            border-radius: 48% 52% 55% 45% / 52% 45% 55% 48%;
-            transform: scale(0.98) rotate(0deg);
-          }
-
-          25% {
-            border-radius: 55% 45% 48% 52% / 45% 55% 48% 52%;
-            transform: scale(1.005) rotate(4deg);
-          }
-
-          50% {
-            border-radius: 45% 55% 52% 48% / 55% 45% 52% 48%;
-            transform: scale(0.99) rotate(8deg);
-          }
-
-          75% {
-            border-radius: 52% 48% 45% 55% / 48% 52% 55% 45%;
-            transform: scale(1.01) rotate(4deg);
-          }
-        }
-
-        @keyframes oceanWaveTwo {
-          0%, 100% {
-            border-radius: 55% 45% 48% 52% / 45% 55% 45% 55%;
-            transform: scale(0.96) rotate(0deg);
-            opacity: 0.4;
-          }
-
-          50% {
-            border-radius: 45% 55% 55% 45% / 55% 45% 52% 48%;
-            transform: scale(1.025) rotate(-10deg);
-            opacity: 0.85;
-          }
-        }
-
-        @keyframes sonarWave {
-          0% {
-            transform: translate(-50%, -50%) scale(0.94);
-            opacity: 0.65;
-          }
-
-          70% {
-            opacity: 0.2;
-          }
-
-          100% {
-            transform: translate(-50%, -50%) scale(1.045);
-            opacity: 0;
-          }
-        }
-
-        @keyframes oceanRotate {
-          from {
-            transform: translate(-50%, -50%) rotate(0deg);
-          }
-
-          to {
-            transform: translate(-50%, -50%) rotate(360deg);
-          }
-        }
-
-        @media (prefers-reduced-motion: reduce) {
-          .voice-range-circle,
-          .voice-range-circle::before,
-          .voice-range-circle::after,
-          .ocean-wave,
-          .ocean-glow {
-            animation: none !important;
-          }
-        }
-      `}</style>
-
       <Header
         user={user}
         onNavigate={onNavigate}
@@ -923,72 +768,8 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
         </div>
       </section>
 
-      {/* Voice controls */}
-      <section
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          alignItems: "center",
-          gap: "10px",
-          padding: "14px",
-        }}
-      >
-        {!voiceJoined ? (
-          <button
-            type="button"
-            onClick={joinVoice}
-            disabled={!connected}
-            style={{
-              padding: "10px 16px",
-              cursor: connected ? "pointer" : "not-allowed",
-            }}
-          >
-            🎙️ Join Voice
-          </button>
-        ) : (
-          <>
-            <button
-              type="button"
-              onClick={toggleMute}
-              style={{ padding: "10px 16px", cursor: "pointer" }}
-            >
-              {muted ? "🔇 Unmute" : "🎙️ Mute"}
-            </button>
-
-            <button
-              type="button"
-              onClick={leaveVoice}
-              style={{
-                padding: "10px 16px",
-                cursor: "pointer",
-              }}
-            >
-              Leave Voice
-            </button>
-          </>
-        )}
-
-        <span>
-          {voiceJoined
-            ? muted
-              ? "Microphone muted"
-              : "Voice enabled"
-            : "Not in voice chat"}
-        </span>
-
-        <span>
-          Audio connections: {Object.keys(remoteStreams).length}
-        </span>
-
-        {voiceError && (
-          <span
-            role="alert"
-            style={{ color: "crimson", flexBasis: "100%" }}
-          >
-            {voiceError}
-          </span>
-        )}
-
+      {/* Remote audio elements stay mounted while navigating pages. */}
+      <div className="office-audio-elements">
         {Object.entries(remoteStreams).map(([peerId, stream]) => (
           <audio
             key={peerId}
@@ -997,6 +778,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
             ref={(element) => {
               if (element && element.srcObject !== stream) {
                 element.srcObject = stream;
+
                 element.play().catch((error) => {
                   console.warn(
                     "Audio playback needs browser permission:",
@@ -1007,7 +789,7 @@ function VirtualOffice({ user, onNavigate, onLogout }) {
             }}
           />
         ))}
-      </section>
+      </div>
     </main>
   );
 }

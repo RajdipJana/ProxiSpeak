@@ -1,9 +1,10 @@
 import { useState } from "react";
+import Header from "../components/Header";
 import "./Profile.css";
 
 const API_URL = "http://localhost:5000";
 
-function Profile({ user, onBack }) {
+function Profile({ user, onNavigate, onLogout }) {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -80,6 +81,15 @@ function Profile({ user, onBack }) {
 
   return (
     <div className="profile-page">
+
+      {/* SHARED HEADER */}
+      <Header
+        user={user}
+        onNavigate={onNavigate}
+        onLogout={onLogout}
+        currentPage="Profile"
+      />
+
       <div className="profile-container">
 
         <div className="profile-header">
@@ -90,10 +100,6 @@ function Profile({ user, onBack }) {
               Manage your employee information and account security.
             </p>
           </div>
-
-          <button className="profile-back-button" onClick={onBack}>
-            <span>←</span> Back to Office
-          </button>
         </div>
 
         <div className="profile-content">

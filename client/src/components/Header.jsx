@@ -11,9 +11,19 @@ function Header({
 }) {
   const {
     connected,
-    employees,
-    nearbyEmployees,
-    voiceRange,
+    employees = [],
+    nearbyEmployees = [],
+    voiceRange = 120,
+
+    voiceJoined = false,
+    muted = false,
+    voiceError = "",
+    audioConnections = 0,
+    voiceDisabled = false,
+
+    onJoinVoice,
+    onToggleMute,
+    onLeaveVoice,
   } = useContext(AppStatusContext);
 
   const nearestEmployee =
@@ -87,7 +97,6 @@ function Header({
   return (
     <header className="app-header">
       <div className="header-main">
-
         <div className="header-brand">
           <div className="header-logo">P</div>
 
@@ -101,24 +110,85 @@ function Header({
           </div>
         </div>
 
-        <nav className="header-nav">
-          {navItems.map((item) => (
-            <button
-              key={item.page}
-              type="button"
-              className={`nav-link ${
-                currentPage === item.page ? "active" : ""
-              }`}
-              onClick={() => onNavigate(item.page)}
-              aria-current={
-                currentPage === item.page ? "page" : undefined
-              }
-            >
-              <span className="nav-icon">{item.icon}</span>
-              <span className="nav-label">{item.label}</span>
-            </button>
-          ))}
-        </nav>
+        <div className="header-center">
+          <nav className="header-nav">
+            {navItems.map((item) => (
+              <button
+                key={item.page}
+                type="button"
+                className={`nav-link ${
+                  currentPage === item.page ? "active" : ""
+                }`}
+                onClick={() => onNavigate(item.page)}
+                aria-current={
+                  currentPage === item.page ? "page" : undefined
+                }
+              >
+                <span className="nav-icon">{item.icon}</span>
+                <span className="nav-label">{item.label}</span>
+              </button>
+            ))}
+          </nav>
+
+          {/* GLOBAL VOICE CONTROLS — visible on every page. */}
+          <div className="header-voice">
+            {!voiceJoined ? (
+              <button
+                type="button"
+                className="voice-action-button join-voice-button"
+                onClick={onJoinVoice}
+                disabled={voiceDisabled}
+              >
+                <span>🎙️</span>
+                Join Voice
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="voice-action-button mute-voice-button"
+                  onClick={onToggleMute}
+                >
+                  {muted ? "🔇 Unmute" : "🎙️ Mute"}
+                </button>
+
+                <button
+                  type="button"
+                  className="voice-action-button leave-voice-button"
+                  onClick={onLeaveVoice}
+                >
+                  Leave
+                </button>
+              </>
+            )}
+
+            <div className="voice-status-info">
+              <span
+                className={`voice-status-dot ${
+                  voiceJoined ? "voice-active" : ""
+                }`}
+              />
+
+              <span className="voice-status-text">
+                {voiceJoined
+                  ? muted
+                    ? "Microphone muted"
+                    : "In voice chat"
+                  : "Not in voice chat"}
+              </span>
+
+              <span className="voice-connection-count">
+                Audio: {audioConnections}
+              </span>
+            </div>
+
+            {voiceError && (
+              <div className="header-voice-error" role="alert">
+                {voiceError}
+              </div>
+            )}
+          </div>
+        </div>
 
         <div className="header-profile">
           <ProfileDropdown
@@ -131,7 +201,6 @@ function Header({
 
       {/* GLOBAL LIVE STATUS */}
       <div className="header-status">
-
         <div className="status-item">
           <span
             className={`status-indicator ${
@@ -159,8 +228,6 @@ function Header({
           <strong>{nearbyEmployees.length}</strong>
         </div>
 
-        {/* <div className="status-divider" /> */}
-
         <div className="status-item nearest-status">
           <span className="status-icon">-</span>
           <span className="nearest-label">
@@ -183,16 +250,17 @@ function Header({
         <div className="status-item movement-status">
           <span className="status-icon">⌨</span>
           <span>Move:</span>
+
           <div className="keyboard-keys">
             <kbd>W</kbd>
             <kbd>A</kbd>
             <kbd>S</kbd>
             <kbd>D</kbd>
           </div>
+
           <span className="or-label">or</span>
           <span className="arrow-keys">↑ ↓ ← →</span>
         </div>
-
       </div>
     </header>
   );

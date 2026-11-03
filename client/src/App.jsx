@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 
 import Login from "./pages/Login";
 import VirtualOffice from "./pages/VirtualOffice";
@@ -21,6 +21,25 @@ function App() {
   const [employees, setEmployees] = useState([]);
   const [nearbyEmployees, setNearbyEmployees] = useState([]);
   const [voiceRange, setVoiceRange] = useState(120);
+
+  // Global voice controls managed by the persistent VirtualOffice.
+  const [voiceControls, setVoiceControls] = useState({
+    voiceJoined: false,
+    muted: false,
+    voiceError: "",
+    audioConnections: 0,
+    voiceDisabled: true,
+    onJoinVoice: () => {},
+    onToggleMute: () => {},
+    onLeaveVoice: () => {},
+  });
+
+  const handleVoiceControlsChange = useCallback((controls) => {
+    setVoiceControls(controls);
+  }, []);
+
+  // GLOBAL TEMPORARY CHAT MESSAGES.
+  const [messages, setMessages] = useState([]);
 
   // Keep browser history synchronized.
   useEffect(() => {
@@ -49,18 +68,17 @@ function App() {
       setConnected(false);
       setEmployees([]);
       setNearbyEmployees([]);
+      setMessages([]);
 
       return;
     }
 
-    // Send JWT token to the backend for authentication.
     socket.auth = {
       token: user.token,
     };
 
     function handleConnect() {
       console.log("Authenticated Socket.IO connection established.");
-
       setConnected(true);
     }
 
@@ -84,8 +102,23 @@ function App() {
 
     function handleConnectError(error) {
       console.error("Socket connection error:", error.message);
-
       setConnected(false);
+    }
+
+    function handleNewMessage(message) {
+      if (!message || !message.id) return;
+
+      setMessages((previousMessages) => {
+        if (
+          previousMessages.some(
+            (existingMessage) => existingMessage.id === message.id
+          )
+        ) {
+          return previousMessages;
+        }
+
+        return [...previousMessages, message];
+      });
     }
 
     socket.on("connect", handleConnect);
@@ -93,6 +126,7 @@ function App() {
     socket.on("employeesUpdate", handleEmployeesUpdate);
     socket.on("proximityUpdate", handleProximityUpdate);
     socket.on("connect_error", handleConnectError);
+    socket.on("newMessage", handleNewMessage);
 
     if (socket.connected) {
       handleConnect();
@@ -106,15 +140,15 @@ function App() {
       socket.off("employeesUpdate", handleEmployeesUpdate);
       socket.off("proximityUpdate", handleProximityUpdate);
       socket.off("connect_error", handleConnectError);
+      socket.off("newMessage", handleNewMessage);
 
-      // Disconnect only when the logged-in session changes,
-      // not when navigating between application pages.
       socket.disconnect();
     };
   }, [user]);
 
   // Handle successful login.
   function handleLogin(userData) {
+    setMessages([]);
     setUser(userData);
     setCurrentPage("VirtualOffice");
 
@@ -129,12 +163,24 @@ function App() {
   function handleLogout() {
     socket.disconnect();
 
+    setMessages([]);
     setUser(null);
     setCurrentPage("VirtualOffice");
 
     setConnected(false);
     setEmployees([]);
     setNearbyEmployees([]);
+
+    setVoiceControls({
+      voiceJoined: false,
+      muted: false,
+      voiceError: "",
+      audioConnections: 0,
+      voiceDisabled: true,
+      onJoinVoice: () => {},
+      onToggleMute: () => {},
+      onLeaveVoice: () => {},
+    });
 
     window.history.replaceState(null, "", "/");
   }
@@ -152,7 +198,6 @@ function App() {
     setCurrentPage(page);
   }
 
-  // Show login page when no user is authenticated.
   if (!user) {
     return <Login onLogin={handleLogin} />;
   }
@@ -164,12 +209,13 @@ function App() {
     onLogout: handleLogout,
     onBack: () => handleNavigate("VirtualOffice"),
 
-    // Shared live employee information.
     onlineEmployees: employees,
     connected,
+
+    messages,
   };
 
-  let currentPageComponent;
+  let currentPageComponent = null;
 
   switch (currentPage) {
     case "Profile":
@@ -198,7 +244,8 @@ function App() {
 
     case "VirtualOffice":
     default:
-      currentPageComponent = <VirtualOffice {...pageProps} />;
+      // VirtualOffice is rendered separately and stays mounted.
+      currentPageComponent = null;
       break;
   }
 
@@ -209,8 +256,25 @@ function App() {
         employees,
         nearbyEmployees,
         voiceRange,
+
+        // Shared global voice controls.
+        ...voiceControls,
       }}
     >
+      {/* Persistent VirtualOffice: hidden, not unmounted, on other pages. */}
+      <div
+        style={{
+          display: currentPage === "VirtualOffice" ? "block" : "none",
+        }}
+      >
+        <VirtualOffice
+          {...pageProps}
+          isActive={currentPage === "VirtualOffice"}
+          onVoiceControlsChange={handleVoiceControlsChange}
+        />
+      </div>
+
+      {/* Other application pages render normally. */}
       {currentPageComponent}
     </AppStatusContext.Provider>
   );
