@@ -1,3 +1,4 @@
+
 /* =========================================
    PROXISPEAK PROFESSIONAL HEADER
 ========================================= */
@@ -131,6 +132,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 
 .nav-icon svg {
@@ -155,6 +157,150 @@
   color: white;
   border-color: #6254e9;
   box-shadow: 0 5px 12px rgba(99, 91, 255, 0.28);
+}
+
+/* =========================================
+   ROOMS DROPDOWN
+========================================= */
+
+.rooms-nav-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  z-index: 200;
+}
+
+.rooms-dropdown-trigger {
+  position: relative;
+}
+
+.rooms-chevron {
+  width: 15px;
+  height: 15px;
+  margin-left: 1px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.22s ease;
+}
+
+.rooms-chevron.open {
+  transform: rotate(180deg);
+}
+
+/* Dropdown panel */
+
+.rooms-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 12px);
+  left: 0;
+  width: 245px;
+  padding: 9px;
+  background: #ffffff;
+  border: 1px solid #e6e5f3;
+  border-radius: 14px;
+  box-shadow: 0 14px 35px rgba(31, 35, 70, 0.18);
+  z-index: 1000;
+  animation: roomsDropdownAppear 0.18s ease-out;
+  transform-origin: top left;
+}
+
+@keyframes roomsDropdownAppear {
+  from {
+    opacity: 0;
+    transform: translateY(-7px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.rooms-dropdown-heading {
+  padding: 9px 11px 10px;
+  color: #9296a9;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.1px;
+  border-bottom: 1px solid #f0eff7;
+  margin-bottom: 5px;
+}
+
+/* Individual room options */
+
+.rooms-dropdown-item {
+  width: 100%;
+  min-height: 46px;
+  padding: 0 11px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: #42475f;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.rooms-dropdown-item:hover {
+  background: #f0efff;
+  color: #5145d9;
+  border-color: #e4e1ff;
+  transform: translateX(2px);
+}
+
+.rooms-dropdown-item.selected {
+  background: #f0efff;
+  color: #5145d9;
+  border-color: #e4e1ff;
+}
+
+.rooms-item-icon {
+  width: 29px;
+  height: 29px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 8px;
+  background: #f2f1ff;
+  color: #6559df;
+}
+
+.rooms-item-icon svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.rooms-dropdown-item:hover .rooms-item-icon,
+.rooms-dropdown-item.selected .rooms-item-icon {
+  background: #e4e1ff;
+}
+
+.rooms-current-indicator {
+  margin-left: auto;
+  padding: 4px 7px;
+  border-radius: 20px;
+  background: #e9f8c4;
+  color: #527b0b;
+  font-size: 9px;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 /* VOICE CONTROLS */
@@ -461,6 +607,15 @@
   .nav-icon svg {
     width: 18px;
     height: 18px;
+  }
+
+  .rooms-dropdown-menu {
+    width: 225px;
+  }
+
+  .rooms-dropdown-item {
+    min-height: 44px;
+    font-size: 12px;
   }
 
   .header-voice {

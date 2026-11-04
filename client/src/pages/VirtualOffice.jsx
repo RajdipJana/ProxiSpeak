@@ -10,7 +10,19 @@ import socket from "../socket";
 import AppStatusContext from "../AppStatusContext";
 import "../App.css";
 import "./VirtualOffice.css";
-import officeFloor from "../assets/office-floor.png";
+
+import workspaceFloor from "../assets/MainOffice.png";
+import conferenceFloor from "../assets/ConferenceRoom.png";
+import meetingRoom1Floor from "../assets/MeetingRoom1.png";
+import meetingRoom2Floor from "../assets/MeetingRoom2.png";
+
+// Room backgrounds
+const ROOM_BACKGROUNDS = {
+  workspace: workspaceFloor,
+  conference: conferenceFloor,
+  meeting1: meetingRoom1Floor,
+  meeting2: meetingRoom2Floor,
+};
 
 // Public STUN server helps peers discover direct connection paths.
 const RTC_CONFIG = {
@@ -31,6 +43,7 @@ function VirtualOffice({
     connected = false,
     nearbyEmployees = [],
     voiceRange = 120,
+    currentRoom = "workspace",
   } = useContext(AppStatusContext);
 
   const [myEmployeeId, setMyEmployeeId] = useState("");
@@ -39,6 +52,26 @@ function VirtualOffice({
   const [muted, setMuted] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const [remoteStreams, setRemoteStreams] = useState({});
+
+  // Room configuration
+  const activeRoom = ROOM_BACKGROUNDS[currentRoom]
+    ? currentRoom
+    : "workspace";
+
+  const officeFloor = ROOM_BACKGROUNDS[activeRoom];
+
+  const isGroupRoom = activeRoom !== "workspace";
+
+  // Only show employees who belong to this room.
+  const roomEmployees = employees.filter(
+    (employee) => employee.currentRoom === activeRoom
+  );
+
+  // The backend supplies room-specific nearby employees.
+  const roomNearbyEmployees = nearbyEmployees.filter(
+    (employee) =>
+      employee.currentRoom === activeRoom
+  );
 
   // WebRTC refs
   const localStreamRef = useRef(null);
@@ -51,8 +84,8 @@ function VirtualOffice({
 
   // Keep the latest nearby employees available to voice functions.
   useEffect(() => {
-    nearbyRef.current = nearbyEmployees;
-  }, [nearbyEmployees]);
+    nearbyRef.current = roomNearbyEmployees;
+  }, [roomNearbyEmployees]);
 
   // ==========================================
   // CLOSE A PEER CONNECTION
@@ -183,7 +216,7 @@ function VirtualOffice({
       console.error("Could not start voice connection:", error);
 
       setVoiceError(
-        "Could not connect to a nearby colleague."
+        "Could not connect to a colleague."
       );
     } finally {
       offerInProgressRef.current.delete(peerId);
@@ -396,14 +429,39 @@ function VirtualOffice({
   }, [closePeerConnection]);
 
   // ==========================================
-  // HANDLE PROXIMITY CHANGES FOR VOICE
+  // ROOM CHANGE — CLEAN UP OLD VOICE CONNECTIONS
+  // ==========================================
+
+  useEffect(() => {
+    // A room transition ends all peer connections
+    // from the previous room.
+    for (const peerId of peerConnectionsRef.current.keys()) {
+      closePeerConnection(peerId);
+    }
+
+    peerConnectionsRef.current.clear();
+    pendingCandidatesRef.current.clear();
+    offerInProgressRef.current.clear();
+    announcedPeersRef.current.clear();
+
+    setRemoteStreams({});
+
+    // Keep the microphone active if the user was
+    // already in voice. The next effect will connect
+    // to colleagues in the new room.
+  }, [activeRoom, closePeerConnection]);
+
+  // ==========================================
+  // HANDLE PROXIMITY / GROUP VOICE CHANGES
   // ==========================================
 
   useEffect(() => {
     const nearbyIds = new Set(
-      nearbyEmployees.map((employee) => employee.socketId)
+      roomNearbyEmployees.map((employee) => employee.socketId)
     );
 
+    // Close connections to employees who are no longer
+    // valid voice participants in this room.
     for (const peerId of peerConnectionsRef.current.keys()) {
       if (!nearbyIds.has(peerId)) {
         closePeerConnection(peerId);
@@ -416,8 +474,9 @@ function VirtualOffice({
       }
     }
 
+    // Announce voice availability to the current room.
     if (voiceEnabledRef.current && socket.connected) {
-      nearbyEmployees.forEach((employee) => {
+      roomNearbyEmployees.forEach((employee) => {
         const peerId = employee.socketId;
 
         if (
@@ -438,7 +497,11 @@ function VirtualOffice({
         });
       });
     }
-  }, [nearbyEmployees, closePeerConnection]);
+  }, [
+    roomNearbyEmployees,
+    activeRoom,
+    closePeerConnection,
+  ]);
 
   // ==========================================
   // JOIN VOICE
@@ -633,7 +696,7 @@ function VirtualOffice({
 
       if (event.ctrlKey || event.altKey || event.metaKey) return;
 
-      const currentEmployee = employees.find(
+      const currentEmployee = roomEmployees.find(
         (employee) => employee.socketId === myEmployeeId
       );
 
@@ -661,7 +724,11 @@ function VirtualOffice({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [employees, myEmployeeId, isActive]);
+  }, [
+    roomEmployees,
+    myEmployeeId,
+    isActive,
+  ]);
 
   // ==========================================
   // VIRTUAL OFFICE UI
@@ -674,18 +741,19 @@ function VirtualOffice({
         onNavigate={onNavigate}
         onLogout={onLogout}
         currentPage="VirtualOffice"
+        currentRoom={activeRoom}
       />
 
       <section className="office-stage">
         <img
           className="office-background"
           src={officeFloor}
-          alt="ProxiSpeak virtual office floor plan"
+          alt={`${activeRoom} virtual office floor plan`}
           draggable="false"
         />
 
         <div className="player-layer">
-          {employees.map((employee) => {
+          {roomEmployees.map((employee) => {
             const isMe = employee.socketId === myEmployeeId;
 
             const initials = (employee.name || "Guest")
@@ -695,7 +763,7 @@ function VirtualOffice({
               .slice(0, 2)
               .toUpperCase();
 
-            const isNearby = nearbyEmployees.some(
+            const isNearby = roomNearbyEmployees.some(
               (nearby) => nearby.socketId === employee.socketId
             );
 
@@ -709,50 +777,57 @@ function VirtualOffice({
                 }}
               >
                 <div className="avatar-voice-wrapper">
-                  <div
-                    className="voice-range-circle"
-                    style={{
-                      "--voice-range-size": `${voiceRange * 2}px`,
-                    }}
-                    title={`Voice range: ${voiceRange}px`}
-                  />
+                  {/* Proximity visuals are only needed in Workspace. */}
+                  {!isGroupRoom && (
+                    <>
+                      <div
+                        className="voice-range-circle"
+                        style={{
+                          "--voice-range-size": `${voiceRange * 2}px`,
+                        }}
+                        title={`Voice range: ${voiceRange}px`}
+                      />
 
-                  <div
-                    className="ocean-wave wave-one"
-                    style={{
-                      "--voice-range-size": `${voiceRange * 2}px`,
-                    }}
-                  />
+                      <div
+                        className="ocean-wave wave-one"
+                        style={{
+                          "--voice-range-size": `${voiceRange * 2}px`,
+                        }}
+                      />
 
-                  <div
-                    className="ocean-wave wave-two"
-                    style={{
-                      "--voice-range-size": `${voiceRange * 2}px`,
-                    }}
-                  />
+                      <div
+                        className="ocean-wave wave-two"
+                        style={{
+                          "--voice-range-size": `${voiceRange * 2}px`,
+                        }}
+                      />
 
-                  <div
-                    className="ocean-wave wave-three"
-                    style={{
-                      "--voice-range-size": `${voiceRange * 2}px`,
-                    }}
-                  />
+                      <div
+                        className="ocean-wave wave-three"
+                        style={{
+                          "--voice-range-size": `${voiceRange * 2}px`,
+                        }}
+                      />
 
-                  <div
-                    className="ocean-glow"
-                    style={{
-                      "--voice-range-size": `${voiceRange * 2}px`,
-                    }}
-                  />
+                      <div
+                        className="ocean-glow"
+                        style={{
+                          "--voice-range-size": `${voiceRange * 2}px`,
+                        }}
+                      />
+                    </>
+                  )}
 
                   <div
                     className={`avatar ${
                       isMe ? "my-avatar" : "other-avatar"
                     }`}
                     title={
-                      isNearby
-                        ? `${employee.name} — nearby`
-                        : employee.name
+                      isGroupRoom
+                        ? employee.name
+                        : isNearby
+                          ? `${employee.name} — nearby`
+                          : employee.name
                     }
                   >
                     {initials}

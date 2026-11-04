@@ -51,16 +51,100 @@ const TARGET_QUERY_TIME_MS = 20;
 const CLUSTER_DISTANCE_PIXELS = 100;
 
 const COLLISION_DISTANCE = 20;
-
-// Maximum chat message length.
 const MAX_CHAT_MESSAGE_LENGTH = 1000;
 
-// Currently connected Socket.IO sessions.
+// ==========================================
+// ROOM CONFIGURATION
+// ==========================================
+
+const ROOMS = {
+  workspace: {
+    id: "workspace",
+    name: "Workspace",
+    voiceMode: "proximity",
+  },
+
+  conference: {
+    id: "conference",
+    name: "Conference Room",
+    voiceMode: "group",
+  },
+
+  meeting1: {
+    id: "meeting1",
+    name: "Meeting Room 01",
+    voiceMode: "group",
+  },
+
+  meeting2: {
+    id: "meeting2",
+    name: "Meeting Room 02",
+    voiceMode: "group",
+  },
+};
+
+const DEFAULT_ROOM = "workspace";
+
+function isValidRoom(roomId) {
+  return (
+    typeof roomId === "string" &&
+    Object.prototype.hasOwnProperty.call(ROOMS, roomId)
+  );
+}
+
+function getRoomInfo(roomId) {
+  return ROOMS[roomId] || ROOMS[DEFAULT_ROOM];
+}
+
+// ==========================================
+// CONNECTED EMPLOYEES
+// ==========================================
+
+// Key: Socket ID
 const employees = new Map();
 
-// Preserve positions across reconnections.
-// Key: employeeId, Value: { x, y }
+// Employee positions are stored separately for each room.
+//
+// Structure:
+// employeePositions = Map {
+//   employeeId: {
+//     workspace: { x, y },
+//     conference: { x, y },
+//     meeting1: { x, y },
+//     meeting2: { x, y }
+//   }
+// }
+
 const employeePositions = new Map();
+
+// ==========================================
+// POSITION STORAGE HELPERS
+// ==========================================
+
+function getEmployeeRoomPositions(userId) {
+  if (!employeePositions.has(userId)) {
+    employeePositions.set(userId, {});
+  }
+
+  return employeePositions.get(userId);
+}
+
+function getSavedPosition(userId, roomId) {
+  const positions = getEmployeeRoomPositions(userId);
+
+  return positions[roomId] || null;
+}
+
+function saveEmployeePosition(employee) {
+  const positions = getEmployeeRoomPositions(employee.userId);
+
+  positions[employee.currentRoom] = {
+    x: employee.x,
+    y: employee.y,
+  };
+
+  employeePositions.set(employee.userId, positions);
+}
 
 // ==========================================
 // SOCKET JWT AUTHENTICATION
@@ -72,7 +156,9 @@ io.use(async (socket, next) => {
     const token = auth.token;
 
     if (typeof token !== "string" || !token.trim()) {
-      return next(new Error("Authentication required. Please log in."));
+      return next(
+        new Error("Authentication required. Please log in.")
+      );
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -103,7 +189,11 @@ io.use(async (socket, next) => {
   } catch (error) {
     console.error("Socket authentication failed:", error.message);
 
-    next(new Error("Invalid or expired login session. Please log in again."));
+    next(
+      new Error(
+        "Invalid or expired login session. Please log in again."
+      )
+    );
   }
 });
 
@@ -126,11 +216,22 @@ function distanceBetweenEmployees(employee1, employee2) {
 
 // ==========================================
 // COLLISION DETECTION
+// ROOM-SPECIFIC
 // ==========================================
 
-function isPositionAvailable(x, y, excludeSocketId = null) {
+function isPositionAvailable(
+  x,
+  y,
+  roomId,
+  excludeSocketId = null
+) {
   for (const employee of employees.values()) {
     if (employee.socketId === excludeSocketId) {
+      continue;
+    }
+
+    // Employees in different rooms cannot collide.
+    if (employee.currentRoom !== roomId) {
       continue;
     }
 
@@ -151,13 +252,25 @@ function isPositionAvailable(x, y, excludeSocketId = null) {
 
 // ==========================================
 // FIND A FREE SPAWN POSITION
+// ROOM-SPECIFIC
 // ==========================================
 
-function findFreePosition(preferredX, preferredY) {
-  const x = Math.max(30, Math.min(OFFICE_WIDTH - 30, preferredX));
-  const y = Math.max(30, Math.min(OFFICE_HEIGHT - 30, preferredY));
+function findFreePosition(
+  preferredX,
+  preferredY,
+  roomId
+) {
+  const x = Math.max(
+    30,
+    Math.min(OFFICE_WIDTH - 30, preferredX)
+  );
 
-  if (isPositionAvailable(x, y)) {
+  const y = Math.max(
+    30,
+    Math.min(OFFICE_HEIGHT - 30, preferredY)
+  );
+
+  if (isPositionAvailable(x, y, roomId)) {
     return { x, y };
   }
 
@@ -183,7 +296,13 @@ function findFreePosition(preferredX, preferredY) {
         )
       );
 
-      if (isPositionAvailable(candidateX, candidateY)) {
+      if (
+        isPositionAvailable(
+          candidateX,
+          candidateY,
+          roomId
+        )
+      ) {
         return {
           x: candidateX,
           y: candidateY,
@@ -192,10 +311,18 @@ function findFreePosition(preferredX, preferredY) {
     }
   }
 
-  // Final fallback: scan the office in a grid.
-  for (let gridY = 30; gridY <= OFFICE_HEIGHT - 30; gridY += step) {
-    for (let gridX = 30; gridX <= OFFICE_WIDTH - 30; gridX += step) {
-      if (isPositionAvailable(gridX, gridY)) {
+  // Final fallback: scan the room in a grid.
+  for (
+    let gridY = 30;
+    gridY <= OFFICE_HEIGHT - 30;
+    gridY += step
+  ) {
+    for (
+      let gridX = 30;
+      gridX <= OFFICE_WIDTH - 30;
+      gridX += step
+    ) {
+      if (isPositionAvailable(gridX, gridY, roomId)) {
         return {
           x: gridX,
           y: gridY,
@@ -209,11 +336,14 @@ function findFreePosition(preferredX, preferredY) {
 
 // ==========================================
 // RESOLVE EMPLOYEE MOVEMENT
+// ROOM-SPECIFIC
 // ==========================================
 
 function resolveMovement(employee, targetX, targetY) {
   const currentX = employee.x;
   const currentY = employee.y;
+
+  const roomId = employee.currentRoom;
 
   const nextX = Math.max(
     30,
@@ -229,6 +359,7 @@ function resolveMovement(employee, targetX, targetY) {
     isPositionAvailable(
       nextX,
       nextY,
+      roomId,
       employee.socketId
     )
   ) {
@@ -241,12 +372,14 @@ function resolveMovement(employee, targetX, targetY) {
   const horizontalAvailable = isPositionAvailable(
     nextX,
     currentY,
+    roomId,
     employee.socketId
   );
 
   const verticalAvailable = isPositionAvailable(
     currentX,
     nextY,
+    roomId,
     employee.socketId
   );
 
@@ -288,6 +421,79 @@ function resolveMovement(employee, targetX, targetY) {
 }
 
 // ==========================================
+// EMPLOYEE STATE BROADCAST
+// ==========================================
+
+function broadcastEmployeeState() {
+  const employeeList = Array.from(employees.values());
+
+  // Keep the global employee directory updated.
+  // Each employee includes their currentRoom.
+  io.emit("employeesUpdate", employeeList);
+
+  // Send room-aware proximity information.
+  for (const socket of io.sockets.sockets.values()) {
+    const currentEmployee = employees.get(socket.id);
+
+    if (!currentEmployee) continue;
+
+    const roomInfo = getRoomInfo(
+      currentEmployee.currentRoom
+    );
+
+    const sameRoomEmployees = employeeList
+      .filter((employee) => {
+        return (
+          employee.socketId !== socket.id &&
+          employee.currentRoom === currentEmployee.currentRoom
+        );
+      });
+
+    let voiceParticipants;
+
+    if (roomInfo.voiceMode === "proximity") {
+      // Workspace: only employees within 120 pixels.
+      voiceParticipants = sameRoomEmployees
+        .map((employee) => ({
+          ...employee,
+          distance: Number(
+            distanceBetweenEmployees(
+              currentEmployee,
+              employee
+            ).toFixed(2)
+          ),
+        }))
+        .filter(
+          (employee) => employee.distance <= VOICE_RANGE
+        );
+    } else {
+      // Meeting rooms: every employee in the same room.
+      voiceParticipants = sameRoomEmployees.map(
+        (employee) => ({
+          ...employee,
+          distance: Number(
+            distanceBetweenEmployees(
+              currentEmployee,
+              employee
+            ).toFixed(2)
+          ),
+        })
+      );
+    }
+
+    socket.emit("proximityUpdate", {
+      nearbyEmployees: voiceParticipants,
+      voiceRange:
+        roomInfo.voiceMode === "proximity"
+          ? VOICE_RANGE
+          : null,
+      currentRoom: currentEmployee.currentRoom,
+      voiceMode: roomInfo.voiceMode,
+    });
+  }
+}
+
+// ==========================================
 // HEALTH CHECK
 // ==========================================
 
@@ -295,16 +501,28 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     message: "ProxiSpeak backend is running.",
+
     coordinateSystem: "Virtual office pixels (x, y)",
+
     office: {
       width: OFFICE_WIDTH,
       height: OFFICE_HEIGHT,
     },
+
+    rooms: Object.values(ROOMS),
+
+    defaultRoom: DEFAULT_ROOM,
+
     voiceRangePixels: VOICE_RANGE,
+
     collisionDistancePixels: COLLISION_DISTANCE,
+
     connectedEmployees: employees.size,
+
     cachedEmployeePositions: employeePositions.size,
+
     chatEnabled: true,
+
     chatStorage: "Temporary frontend state only",
   });
 });
@@ -340,7 +558,9 @@ app.post("/api/spatial-audit/demo-data", async (req, res) => {
 
     await UserLocation.deleteMany({
       userId: {
-        $in: demoEmployees.map((employee) => employee.userId),
+        $in: demoEmployees.map(
+          (employee) => employee.userId
+        ),
       },
     });
 
@@ -348,9 +568,15 @@ app.post("/api/spatial-audit/demo-data", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Virtual-office demo data inserted successfully.",
-      note: "These are fixed database test records, not live positions.",
+
+      message:
+        "Virtual-office demo data inserted successfully.",
+
+      note:
+        "These are fixed database test records, not live positions.",
+
       coordinateSystem: "Virtual office pixels (x, y)",
+
       employees: demoEmployees.map((employee) => ({
         userId: employee.userId,
         name: employee.name,
@@ -370,7 +596,7 @@ app.post("/api/spatial-audit/demo-data", async (req, res) => {
 });
 
 // ==========================================
-// SPATIAL AUDIT — LIVE POSITIONS
+// SPATIAL AUDIT — LIVE ROOM POSITIONS
 // ==========================================
 
 app.get("/api/spatial-audit", (req, res) => {
@@ -380,6 +606,16 @@ app.get("/api/spatial-audit", (req, res) => {
     const x = Number(req.query.x ?? 400);
     const y = Number(req.query.y ?? 250);
     const radius = Number(req.query.radius ?? 500);
+
+    const roomId = req.query.room || DEFAULT_ROOM;
+
+    if (!isValidRoom(roomId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid room ID.",
+        availableRooms: Object.keys(ROOMS),
+      });
+    }
 
     if (
       !Number.isFinite(x) ||
@@ -393,8 +629,10 @@ app.get("/api/spatial-audit", (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
+
         message:
           "Provide valid x and y coordinates inside the virtual office and a positive radius.",
+
         office: {
           width: OFFICE_WIDTH,
           height: OFFICE_HEIGHT,
@@ -404,15 +642,18 @@ app.get("/api/spatial-audit", (req, res) => {
 
     const queryStart = performance.now();
 
-    const liveEmployees = Array.from(employees.values()).map(
-      (employee) => ({
+    const liveEmployees = Array.from(employees.values())
+      .filter(
+        (employee) => employee.currentRoom === roomId
+      )
+      .map((employee) => ({
         userId: employee.userId,
         name: employee.name,
         socketId: employee.socketId,
+        currentRoom: employee.currentRoom,
         x: employee.x,
         y: employee.y,
-      })
-    );
+      }));
 
     const queryTimeMs = Number(
       (performance.now() - queryStart).toFixed(3)
@@ -429,18 +670,28 @@ app.get("/api/spatial-audit", (req, res) => {
 
         return {
           ...employee,
-          distancePixels: Number(exactDistance.toFixed(2)),
+          distancePixels: Number(
+            exactDistance.toFixed(2)
+          ),
           exactDistance,
         };
       })
-      .filter((employee) => employee.exactDistance <= radius)
-      .sort((a, b) => a.exactDistance - b.exactDistance)
+      .filter(
+        (employee) => employee.exactDistance <= radius
+      )
+      .sort(
+        (a, b) => a.exactDistance - b.exactDistance
+      )
       .map(({ exactDistance, ...employee }) => employee);
 
     const clusters = [];
     const assigned = new Set();
 
-    for (let i = 0; i < nearbyEmployees.length; i++) {
+    for (
+      let i = 0;
+      i < nearbyEmployees.length;
+      i++
+    ) {
       if (assigned.has(i)) continue;
 
       const cluster = [];
@@ -450,11 +701,16 @@ app.get("/api/spatial-audit", (req, res) => {
 
       while (queue.length > 0) {
         const currentIndex = queue.shift();
-        const currentEmployee = nearbyEmployees[currentIndex];
+        const currentEmployee =
+          nearbyEmployees[currentIndex];
 
         cluster.push(currentEmployee);
 
-        for (let j = 0; j < nearbyEmployees.length; j++) {
+        for (
+          let j = 0;
+          j < nearbyEmployees.length;
+          j++
+        ) {
           if (assigned.has(j)) continue;
 
           const candidate = nearbyEmployees[j];
@@ -480,27 +736,47 @@ app.get("/api/spatial-audit", (req, res) => {
 
     return res.json({
       success: true,
-      dataSource: "Live Socket.IO virtual-office positions",
-      coordinateSystem: "Virtual office pixels (x, y)",
+
+      dataSource:
+        "Live Socket.IO virtual-office positions",
+
+      coordinateSystem:
+        "Virtual office pixels (x, y)",
+
+      room: getRoomInfo(roomId),
+
       searchCenter: { x, y },
+
       radiusPixels: radius,
-      clusterDistancePixels: CLUSTER_DISTANCE_PIXELS,
-      collisionDistancePixels: COLLISION_DISTANCE,
+
+      clusterDistancePixels:
+        CLUSTER_DISTANCE_PIXELS,
+
+      collisionDistancePixels:
+        COLLISION_DISTANCE,
+
       totalConnectedEmployees: liveEmployees.length,
+
       nearbyCount: nearbyEmployees.length,
+
       nearbyEmployees,
+
       clusterCount: clusters.length,
+
       clusters: clusters.map((cluster, index) => ({
         clusterId: index + 1,
         employeeCount: cluster.length,
         employees: cluster,
       })),
+
       performance: {
         queryTimeMs,
         totalProcessingMs,
         targetMs: TARGET_QUERY_TIME_MS,
-        queryWithinTarget: queryTimeMs < TARGET_QUERY_TIME_MS,
-        totalWithinTarget: totalProcessingMs < TARGET_QUERY_TIME_MS,
+        queryWithinTarget:
+          queryTimeMs < TARGET_QUERY_TIME_MS,
+        totalWithinTarget:
+          totalProcessingMs < TARGET_QUERY_TIME_MS,
       },
     });
   } catch (error) {
@@ -515,40 +791,6 @@ app.get("/api/spatial-audit", (req, res) => {
 });
 
 // ==========================================
-// BROADCAST EMPLOYEE STATE
-// ==========================================
-
-function broadcastEmployeeState() {
-  const employeeList = Array.from(employees.values());
-
-  io.emit("employeesUpdate", employeeList);
-
-  for (const socket of io.sockets.sockets.values()) {
-    const currentEmployee = employees.get(socket.id);
-
-    if (!currentEmployee) continue;
-
-    const nearbyEmployees = employeeList
-      .filter((employee) => employee.socketId !== socket.id)
-      .map((employee) => ({
-        ...employee,
-        distance: Number(
-          distanceBetweenEmployees(
-            currentEmployee,
-            employee
-          ).toFixed(2)
-        ),
-      }))
-      .filter((employee) => employee.distance <= VOICE_RANGE);
-
-    socket.emit("proximityUpdate", {
-      nearbyEmployees,
-      voiceRange: VOICE_RANGE,
-    });
-  }
-}
-
-// ==========================================
 // SOCKET CONNECTIONS
 // ==========================================
 
@@ -558,23 +800,37 @@ io.on("connection", (socket) => {
   const userId = authenticatedEmployee.userId;
   const name = authenticatedEmployee.name;
 
-  // Restore previous position if available.
-  const savedPosition = employeePositions.get(userId);
+  // Every new connection starts in Workspace.
+  const initialRoom = DEFAULT_ROOM;
 
-  const preferredX = savedPosition ? savedPosition.x : 400;
-  const preferredY = savedPosition ? savedPosition.y : 250;
+  // Restore this employee's Workspace position.
+  const savedPosition = getSavedPosition(
+    userId,
+    initialRoom
+  );
 
-  // Find a free position for this employee.
+  const preferredX = savedPosition
+    ? savedPosition.x
+    : 400;
+
+  const preferredY = savedPosition
+    ? savedPosition.y
+    : 250;
+
   const spawnPosition = findFreePosition(
     preferredX,
-    preferredY
+    preferredY,
+    initialRoom
   );
 
   if (!spawnPosition) {
-    console.log(`Office full. Connection rejected: ${name}`);
+    console.log(
+      `Workspace full. Connection rejected: ${name}`
+    );
 
     socket.emit("officeFull", {
-      message: "The virtual office is currently full.",
+      message:
+        "The Workspace is currently full.",
     });
 
     socket.disconnect(true);
@@ -583,28 +839,161 @@ io.on("connection", (socket) => {
 
   const employee = {
     socketId: socket.id,
+
     userId,
     name,
+
     role: authenticatedEmployee.role,
     department: authenticatedEmployee.department,
+
+    currentRoom: initialRoom,
+
     x: spawnPosition.x,
     y: spawnPosition.y,
+
     isVoiceActive: false,
     isMuted: false,
   };
 
   employees.set(socket.id, employee);
 
-  employeePositions.set(userId, {
-    x: employee.x,
-    y: employee.y,
-  });
+  saveEmployeePosition(employee);
 
   console.log(
-    `${name} (${userId}) connected (${socket.id}) at X:${employee.x}, Y:${employee.y}`
+    `${name} (${userId}) connected in ${getRoomInfo(initialRoom).name} at X:${employee.x}, Y:${employee.y}`
   );
 
   broadcastEmployeeState();
+
+  // ========================================
+  // ROOM SWITCHING
+  // ========================================
+
+  socket.on("switchRoom", (payload = {}, callback) => {
+    const currentEmployee = employees.get(socket.id);
+
+    if (!currentEmployee) return;
+
+    const requestedRoom =
+      typeof payload.roomId === "string"
+        ? payload.roomId
+        : "";
+
+    // Validate the requested room.
+    if (!isValidRoom(requestedRoom)) {
+      const result = {
+        success: false,
+        message: "Invalid room selected.",
+      };
+
+      if (typeof callback === "function") {
+        callback(result);
+      } else {
+        socket.emit("roomSwitchError", result);
+      }
+
+      return;
+    }
+
+    // No work is needed if the employee is already there.
+    if (currentEmployee.currentRoom === requestedRoom) {
+      const result = {
+        success: true,
+        unchanged: true,
+        currentRoom: currentEmployee.currentRoom,
+        employee: currentEmployee,
+      };
+
+      if (typeof callback === "function") {
+        callback(result);
+      }
+
+      return;
+    }
+
+    const previousRoom = currentEmployee.currentRoom;
+
+    // Preserve the previous room's avatar position.
+    saveEmployeePosition(currentEmployee);
+
+    // Restore the destination room's saved position.
+    const savedDestinationPosition = getSavedPosition(
+      currentEmployee.userId,
+      requestedRoom
+    );
+
+    const preferredX = savedDestinationPosition
+      ? savedDestinationPosition.x
+      : 400;
+
+    const preferredY = savedDestinationPosition
+      ? savedDestinationPosition.y
+      : 250;
+
+    // Find a free position in the destination room.
+    const destinationPosition = findFreePosition(
+      preferredX,
+      preferredY,
+      requestedRoom
+    );
+
+    if (!destinationPosition) {
+      const result = {
+        success: false,
+        message:
+          `${getRoomInfo(requestedRoom).name} is currently full.`,
+      };
+
+      if (typeof callback === "function") {
+        callback(result);
+      } else {
+        socket.emit("roomSwitchError", result);
+      }
+
+      return;
+    }
+
+    // Update room membership on the server.
+    currentEmployee.currentRoom = requestedRoom;
+
+    currentEmployee.x = destinationPosition.x;
+    currentEmployee.y = destinationPosition.y;
+
+    // Reset voice status during the transition.
+    // The frontend will establish the new voice session.
+    currentEmployee.isVoiceActive = false;
+    currentEmployee.isMuted = false;
+
+    employees.set(socket.id, currentEmployee);
+
+    saveEmployeePosition(currentEmployee);
+
+    console.log(
+      `${currentEmployee.name} switched from ${getRoomInfo(previousRoom).name} to ${getRoomInfo(requestedRoom).name}`
+    );
+
+    // Update every connected employee's room state.
+    broadcastEmployeeState();
+
+    const result = {
+      success: true,
+
+      previousRoom,
+
+      currentRoom: requestedRoom,
+
+      room: getRoomInfo(requestedRoom),
+
+      employee: currentEmployee,
+    };
+
+    // Notify the switching employee.
+    socket.emit("roomChanged", result);
+
+    if (typeof callback === "function") {
+      callback(result);
+    }
+  });
 
   // ========================================
   // EMPLOYEE MOVEMENT WITH COLLISION CONTROL
@@ -636,10 +1025,7 @@ io.on("connection", (socket) => {
 
     employees.set(socket.id, currentEmployee);
 
-    employeePositions.set(currentEmployee.userId, {
-      x: currentEmployee.x,
-      y: currentEmployee.y,
-    });
+    saveEmployeePosition(currentEmployee);
 
     broadcastEmployeeState();
   });
@@ -653,13 +1039,11 @@ io.on("connection", (socket) => {
 
     if (!currentEmployee) return;
 
-    // Accept only plain text messages.
     const messageText =
       typeof payload.message === "string"
         ? payload.message.trim()
         : "";
 
-    // Reject empty messages.
     if (!messageText) {
       socket.emit("chatError", {
         message: "Message cannot be empty.",
@@ -668,25 +1052,29 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Enforce message length.
-    if (messageText.length > MAX_CHAT_MESSAGE_LENGTH) {
+    if (
+      messageText.length > MAX_CHAT_MESSAGE_LENGTH
+    ) {
       socket.emit("chatError", {
-        message: `Messages cannot exceed ${MAX_CHAT_MESSAGE_LENGTH} characters.`,
+        message:
+          `Messages cannot exceed ${MAX_CHAT_MESSAGE_LENGTH} characters.`,
       });
 
       return;
     }
 
-    // Sender identity is taken from the authenticated employee.
     const chatMessage = {
       id: `${Date.now()}-${socket.id}`,
+
       senderId: currentEmployee.userId,
       senderName: currentEmployee.name,
+
       message: messageText,
+
       timestamp: new Date().toISOString(),
     };
 
-    // Broadcast to every currently connected office employee.
+    // Existing global office chat is preserved.
     io.emit("newMessage", chatMessage);
 
     console.log(
@@ -713,7 +1101,7 @@ io.on("connection", (socket) => {
     employees.set(socket.id, currentEmployee);
 
     console.log(
-      `${currentEmployee.name} voice status:`,
+      `${currentEmployee.name} (${getRoomInfo(currentEmployee.currentRoom).name}) voice status:`,
       currentEmployee.isVoiceActive
         ? currentEmployee.isMuted
           ? "Muted"
@@ -726,17 +1114,27 @@ io.on("connection", (socket) => {
 
   // ========================================
   // WEBRTC VOICE SIGNALING
+  // ROOM-ISOLATED
   // ========================================
 
   socket.on("voiceSignal", (payload = {}) => {
     const { targetSocketId, signal } = payload;
 
+    const sender = employees.get(socket.id);
+    const target = employees.get(targetSocketId);
+
     if (
+      !sender ||
+      !target ||
       typeof targetSocketId !== "string" ||
       !signal ||
-      targetSocketId === socket.id ||
-      !employees.has(targetSocketId)
+      targetSocketId === socket.id
     ) {
+      return;
+    }
+
+    // Never relay WebRTC signals between different rooms.
+    if (sender.currentRoom !== target.currentRoom) {
       return;
     }
 
@@ -753,10 +1151,12 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     const disconnectedEmployee = employees.get(socket.id);
 
-    employees.delete(socket.id);
+    if (disconnectedEmployee) {
+      // Preserve the employee's current room position.
+      saveEmployeePosition(disconnectedEmployee);
+    }
 
-    // Keep employeePositions intact.
-    // This preserves positions across reconnections.
+    employees.delete(socket.id);
 
     console.log(
       `${disconnectedEmployee?.name || "Employee"} disconnected. Position preserved.`
@@ -786,9 +1186,12 @@ async function startServer() {
 
     await mongoose.connect(process.env.MONGODB_URI);
 
-    console.log("MongoDB Atlas connected successfully!");
+    console.log(
+      "MongoDB Atlas connected successfully!"
+    );
 
-    const indexes = await UserLocation.collection.indexes();
+    const indexes =
+      await UserLocation.collection.indexes();
 
     for (const index of indexes) {
       if (
@@ -796,8 +1199,13 @@ async function startServer() {
         index.key &&
         index.key.location
       ) {
-        await UserLocation.collection.dropIndex(index.name);
-        console.log(`Removed old location index: ${index.name}`);
+        await UserLocation.collection.dropIndex(
+          index.name
+        );
+
+        console.log(
+          `Removed old location index: ${index.name}`
+        );
       }
     }
 
@@ -806,7 +1214,9 @@ async function startServer() {
       { unique: true }
     );
 
-    console.log("Virtual-office location model ready.");
+    console.log(
+      "Virtual-office location model ready."
+    );
 
     server.listen(PORT, () => {
       console.log(
@@ -818,17 +1228,50 @@ async function startServer() {
       );
 
       console.log(`Voice range: ${VOICE_RANGE} pixels`);
-      console.log(`Collision distance: ${COLLISION_DISTANCE} pixels`);
+
+      console.log(
+        `Collision distance: ${COLLISION_DISTANCE} pixels`
+      );
+
       console.log("JWT authentication: enabled");
       console.log("Employee identity source: MongoDB");
       console.log("Authentication API: /api/auth");
-      console.log("Spatial audit source: live connected employees");
+
+      console.log("Multi-room system: enabled");
+      console.log("Available rooms:", Object.keys(ROOMS).join(", "));
+
+      console.log(
+        "Workspace voice: 120px proximity"
+      );
+
+      console.log(
+        "Meeting room voice: unrestricted group"
+      );
+
+      console.log(
+        "Room-specific avatar positions: enabled"
+      );
+
+      console.log(
+        "Room-specific collision detection: enabled"
+      );
+
+      console.log(
+        "Room-isolated WebRTC signaling: enabled"
+      );
+
+      console.log(
+        "Spatial audit source: live room positions"
+      );
+
       console.log("WebRTC signaling: enabled");
       console.log("Live voice status tracking: enabled");
-      console.log("Employee position restoration: enabled");
       console.log("Avatar collision detection: enabled");
       console.log("Real-time office chat: enabled");
-      console.log("Chat message storage: disabled (temporary)");
+
+      console.log(
+        "Chat message storage: disabled (temporary)"
+      );
     });
   } catch (error) {
     console.error("Server startup failed:", error);

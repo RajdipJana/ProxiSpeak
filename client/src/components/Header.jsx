@@ -1,4 +1,6 @@
-import { useContext } from "react";
+
+import { useContext, useState, useEffect, useRef } from "react";
+
 import "./Header.css";
 import ProfileDropdown from "./ProfileDropdown";
 import AppStatusContext from "../AppStatusContext";
@@ -8,12 +10,17 @@ function Header({
   onNavigate,
   onLogout,
   currentPage,
+  currentRoom: currentRoomProp,
+  onRequestRoomChange: onRequestRoomChangeProp,
 }) {
   const {
     connected,
     employees = [],
     nearbyEmployees = [],
     voiceRange = 120,
+
+    currentRoom: contextRoom = "workspace",
+    onRequestRoomChange: contextRequestRoomChange,
 
     voiceJoined = false,
     muted = false,
@@ -26,6 +33,14 @@ function Header({
     onLeaveVoice,
   } = useContext(AppStatusContext);
 
+  const currentRoom = currentRoomProp || contextRoom;
+
+  const onRequestRoomChange =
+    onRequestRoomChangeProp || contextRequestRoomChange;
+
+  const [roomsOpen, setRoomsOpen] = useState(false);
+  const roomsDropdownRef = useRef(null);
+
   const nearestEmployee =
     nearbyEmployees.length > 0
       ? [...nearbyEmployees].sort(
@@ -33,18 +48,67 @@ function Header({
         )[0]
       : null;
 
-  const navItems = [
+  const roomItems = [
     {
-      label: "Office",
-      page: "VirtualOffice",
-      icon: (
-        <svg viewBox="0 0 24 24">
-          <path d="M3 10.5 12 3l9 7.5" />
-          <path d="M5 9.5V21h14V9.5" />
-          <path d="M9 21v-7h6v7" />
-        </svg>
-      ),
+      label: "Conference Room",
+      roomId: "conference",
     },
+    {
+      label: "Meeting Room 01",
+      roomId: "meeting1",
+    },
+    {
+      label: "Meeting Room 02",
+      roomId: "meeting2",
+    },
+  ];
+
+  // Close the Rooms dropdown when clicking outside.
+  useEffect(() => {
+    function handleOutsideClick(event) {
+      if (
+        roomsDropdownRef.current &&
+        !roomsDropdownRef.current.contains(event.target)
+      ) {
+        setRoomsOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handleOutsideClick);
+
+    return () => {
+      document.removeEventListener(
+        "mousedown",
+        handleOutsideClick
+      );
+    };
+  }, []);
+
+  // Handle room selection.
+  function handleRoomSelection(roomId) {
+    setRoomsOpen(false);
+
+    // If already in this room, simply return to the Virtual Office.
+    // Do not request another room transition or disconnect voice.
+    if (roomId === currentRoom) {
+      if (currentPage !== "VirtualOffice") {
+        onNavigate("VirtualOffice");
+      }
+
+      return;
+    }
+
+    // Different room: request confirmation through App.jsx.
+    if (onRequestRoomChange) {
+      onRequestRoomChange(roomId);
+    } else {
+      console.error(
+        "Room navigation handler is not connected yet."
+      );
+    }
+  }
+
+  const navItems = [
     {
       label: "People",
       page: "People",
@@ -112,6 +176,122 @@ function Header({
 
         <div className="header-center">
           <nav className="header-nav">
+            {/* WORKSPACE DIRECT NAVIGATION */}
+            <button
+              type="button"
+              className={`nav-link ${
+                currentPage === "VirtualOffice" &&
+                currentRoom === "workspace"
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() => handleRoomSelection("workspace")}
+              aria-current={
+                currentPage === "VirtualOffice" &&
+                currentRoom === "workspace"
+                  ? "page"
+                  : undefined
+              }
+            >
+              <span className="nav-icon">
+                <svg viewBox="0 0 24 24">
+                  <path d="M3 10.5 12 3l9 7.5" />
+                  <path d="M5 9.5V21h14V9.5" />
+                  <path d="M9 21v-7h6v7" />
+                </svg>
+              </span>
+
+              <span className="nav-label">Workspace</span>
+            </button>
+
+            {/* ROOMS DROPDOWN */}
+            <div
+              className="rooms-nav-container"
+              ref={roomsDropdownRef}
+            >
+              <button
+                type="button"
+                className={`nav-link rooms-dropdown-trigger ${
+                  currentRoom !== "workspace" &&
+                  currentPage === "VirtualOffice"
+                    ? "active"
+                    : ""
+                }`}
+                onClick={() => setRoomsOpen((previous) => !previous)}
+                aria-expanded={roomsOpen}
+                aria-haspopup="true"
+              >
+                <span className="nav-icon">
+                  <svg viewBox="0 0 24 24">
+                    <rect
+                      x="3"
+                      y="4"
+                      width="18"
+                      height="16"
+                      rx="2"
+                    />
+                    <path d="M9 4v16M15 4v16M3 10h18" />
+                  </svg>
+                </span>
+
+                <span className="nav-label">Rooms</span>
+
+                <svg
+                  className={`rooms-chevron ${
+                    roomsOpen ? "open" : ""
+                  }`}
+                  viewBox="0 0 24 24"
+                >
+                  <path d="m7 10 5 5 5-5" />
+                </svg>
+              </button>
+
+              {roomsOpen && (
+                <div className="rooms-dropdown-menu">
+                  <div className="rooms-dropdown-heading">
+                    AVAILABLE ROOMS
+                  </div>
+
+                  {roomItems.map((room) => (
+                    <button
+                      key={room.roomId}
+                      type="button"
+                      className={`rooms-dropdown-item ${
+                        currentRoom === room.roomId
+                          ? "selected"
+                          : ""
+                      }`}
+                      onClick={() =>
+                        handleRoomSelection(room.roomId)
+                      }
+                    >
+                      <span className="rooms-item-icon">
+                        <svg viewBox="0 0 24 24">
+                          <rect
+                            x="4"
+                            y="3"
+                            width="16"
+                            height="18"
+                            rx="2"
+                          />
+                          <path d="M9 3v18M15 3v18" />
+                        </svg>
+                      </span>
+
+                      <span>{room.label}</span>
+
+                      {currentRoom === room.roomId && (
+                        <span className="rooms-current-indicator">
+                          Current
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* REMAINING NAVIGATION */}
             {navItems.map((item) => (
               <button
                 key={item.page}
@@ -130,7 +310,7 @@ function Header({
             ))}
           </nav>
 
-          {/* GLOBAL VOICE CONTROLS — visible on every page. */}
+          {/* GLOBAL VOICE CONTROLS */}
           <div className="header-voice">
             {!voiceJoined ? (
               <button
