@@ -43,7 +43,9 @@ function VirtualOffice({
     employees = [],
     connected = false,
     nearbyEmployees = [],
+    voicePeers = [],
     voiceRange = 120,
+    voiceRangePreference = voiceRange,
     currentRoom = "workspace",
   } = useContext(AppStatusContext);
 
@@ -64,7 +66,6 @@ function VirtualOffice({
     : "workspace";
 
   const officeFloor = ROOM_BACKGROUNDS[activeRoom];
-
   const isGroupRoom = activeRoom !== "workspace";
 
   // Only show employees who belong to this room.
@@ -72,25 +73,194 @@ function VirtualOffice({
     (employee) => employee.currentRoom === activeRoom
   );
 
-  // The backend supplies room-specific nearby employees.
+  // Nearby employees are used for visual status only.
   const roomNearbyEmployees = nearbyEmployees.filter(
-    (employee) =>
-      employee.currentRoom === activeRoom
+    (employee) => employee.currentRoom === activeRoom
   );
+
+  // Voice peers are supplied by the server after its
+  // mutual voice-range permission checks.
+  const roomVoicePeers = voicePeers.filter(
+    (employee) => employee.currentRoom === activeRoom
+  );
+
+  // Current user's selected range.
+  const myVoiceRange = voiceRangePreference === 75 ? 75 : 120;
 
   // WebRTC refs
   const localStreamRef = useRef(null);
   const peerConnectionsRef = useRef(new Map());
   const pendingCandidatesRef = useRef(new Map());
   const offerInProgressRef = useRef(new Set());
-  const nearbyRef = useRef([]);
+  const voicePeersRef = useRef([]);
   const voiceEnabledRef = useRef(false);
   const announcedPeersRef = useRef(new Set());
 
-  // Keep the latest nearby employees available to voice functions.
+  // Remote audio refs
+  const audioElementsRef = useRef(new Map());
+  const audioRefCallbacksRef = useRef(new Map());
+
+  // Keep the latest permitted voice peers available.
   useEffect(() => {
-    nearbyRef.current = roomNearbyEmployees;
-  }, [roomNearbyEmployees]);
+    voicePeersRef.current = roomVoicePeers;
+  }, [roomVoicePeers]);
+
+  // ==========================================
+  // STABLE AUDIO ELEMENT REFS
+  // ==========================================
+
+  const getAudioRef = useCallback((peerId) => {
+    if (!audioRefCallbacksRef.current.has(peerId)) {
+      const callback = (element) => {
+        if (element) {
+          audioElementsRef.current.set(peerId, element);
+        } else {
+          audioElementsRef.current.delete(peerId);
+        }
+      };
+
+      audioRefCallbacksRef.current.set(peerId, callback);
+    }
+
+    return audioRefCallbacksRef.current.get(peerId);
+  }, []);
+
+  // ==========================================
+  // CALCULATE REMOTE AUDIO VOLUME
+  // ==========================================
+
+  const getPeerTargetVolume = useCallback(
+    (peerId) => {
+      // Meeting and conference rooms always use full volume.
+      if (activeRoom !== "workspace") {
+        return 1;
+      }
+
+      const peer = roomVoicePeers.find(
+        (employee) => employee.socketId === peerId
+      );
+
+      // No current permission means no audio.
+      if (!peer) return 0;
+
+      const peerVoiceRange =
+        peer.voiceRange === 75 ? 75 : 120;
+
+      // The server already enforces this mutual restriction.
+      // Keep a client-side check as an additional safeguard.
+      const mutualRange = Math.min(
+        myVoiceRange,
+        peerVoiceRange
+      );
+
+      const distance = Number(peer.distance);
+
+      if (!Number.isFinite(distance)) {
+        return mutualRange === 75 ? 1 : 0;
+      }
+
+      if (distance > mutualRange) {
+        return 0;
+      }
+
+      // If either employee selected 75px, audio is full
+      // volume inside that mutual range.
+      if (mutualRange === 75) {
+        return 1;
+      }
+
+      // Both employees selected 120px.
+      // Full volume from 0px to 75px.
+      if (distance <= 75) {
+        return 1;
+      }
+
+      // Smoothly fade from 100% at 75px to 0% at 120px.
+      if (distance >= 120) {
+        return 0;
+      }
+
+      return Math.max(
+        0,
+        Math.min(1, (120 - distance) / 45)
+      );
+    },
+    [activeRoom, roomVoicePeers, myVoiceRange]
+  );
+
+  // ==========================================
+  // ATTACH REMOTE STREAMS TO AUDIO ELEMENTS
+  // ==========================================
+
+  useEffect(() => {
+    Object.entries(remoteStreams).forEach(
+      ([peerId, stream]) => {
+        const audioElement =
+          audioElementsRef.current.get(peerId);
+
+        if (!audioElement) return;
+
+        if (audioElement.srcObject !== stream) {
+          audioElement.srcObject = stream;
+
+          // Never expose a new stream at full volume
+          // before its correct range volume is applied.
+          audioElement.volume = 0;
+
+          audioElement.play().catch((error) => {
+            console.warn(
+              "Audio playback needs browser permission:",
+              error
+            );
+          });
+        }
+      }
+    );
+  }, [remoteStreams]);
+
+  // ==========================================
+  // SMOOTH AUDIO VOLUME ANIMATION
+  // ==========================================
+
+  useEffect(() => {
+    if (audioElementsRef.current.size === 0) return;
+
+    let animationFrameId;
+
+    function animateAudioVolume() {
+      audioElementsRef.current.forEach(
+        (audioElement, peerId) => {
+          const targetVolume =
+            getPeerTargetVolume(peerId);
+
+          const currentVolume = audioElement.volume;
+          const difference = targetVolume - currentVolume;
+
+          // Smoothly approach the target volume.
+          // This avoids sudden audio level changes.
+          if (Math.abs(difference) < 0.005) {
+            audioElement.volume = targetVolume;
+          } else {
+            audioElement.volume =
+              currentVolume + difference * 0.12;
+          }
+        }
+      );
+
+      animationFrameId =
+        requestAnimationFrame(animateAudioVolume);
+    }
+
+    animationFrameId =
+      requestAnimationFrame(animateAudioVolume);
+
+    return () => {
+      cancelAnimationFrame(animationFrameId);
+    };
+  }, [
+    remoteStreams,
+    getPeerTargetVolume,
+  ]);
 
   // ==========================================
   // CLOSE A PEER CONNECTION
@@ -125,108 +295,118 @@ function VirtualOffice({
   // CREATE A WEBRTC PEER CONNECTION
   // ==========================================
 
-  const createPeerConnection = useCallback((peerId) => {
-    const existing = peerConnectionsRef.current.get(peerId);
+  const createPeerConnection = useCallback(
+    (peerId) => {
+      const existing =
+        peerConnectionsRef.current.get(peerId);
 
-    if (existing) return existing;
+      if (existing) return existing;
 
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    const localStream = localStreamRef.current;
+      const pc = new RTCPeerConnection(RTC_CONFIG);
+      const localStream = localStreamRef.current;
 
-    if (localStream) {
-      localStream.getAudioTracks().forEach((track) => {
-        pc.addTrack(track, localStream);
-      });
-    }
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate && socket.connected) {
-        socket.emit("voiceSignal", {
-          targetSocketId: peerId,
-          signal: {
-            type: "candidate",
-            candidate: event.candidate,
-          },
+      if (localStream) {
+        localStream.getAudioTracks().forEach((track) => {
+          pc.addTrack(track, localStream);
         });
       }
-    };
 
-    pc.ontrack = (event) => {
-      const stream =
-        event.streams?.[0] ||
-        new MediaStream([event.track]);
+      pc.onicecandidate = (event) => {
+        if (event.candidate && socket.connected) {
+          socket.emit("voiceSignal", {
+            targetSocketId: peerId,
+            signal: {
+              type: "candidate",
+              candidate: event.candidate,
+            },
+          });
+        }
+      };
 
-      setRemoteStreams((previous) => ({
-        ...previous,
-        [peerId]: stream,
-      }));
-    };
+      pc.ontrack = (event) => {
+        const stream =
+          event.streams?.[0] ||
+          new MediaStream([event.track]);
 
-    pc.onconnectionstatechange = () => {
-      if (
-        pc.connectionState === "failed" ||
-        pc.connectionState === "closed"
-      ) {
-        closePeerConnection(peerId);
-      }
-    };
+        setRemoteStreams((previous) => ({
+          ...previous,
+          [peerId]: stream,
+        }));
+      };
 
-    peerConnectionsRef.current.set(peerId, pc);
+      pc.onconnectionstatechange = () => {
+        if (
+          pc.connectionState === "failed" ||
+          pc.connectionState === "closed"
+        ) {
+          closePeerConnection(peerId);
+        }
+      };
 
-    return pc;
-  }, [closePeerConnection]);
+      peerConnectionsRef.current.set(peerId, pc);
+
+      return pc;
+    },
+    [closePeerConnection]
+  );
 
   // ==========================================
   // START AN OUTGOING WEBRTC OFFER
   // ==========================================
 
-  const startOffer = useCallback(async (peerId) => {
-    if (
-      !localStreamRef.current ||
-      !voiceEnabledRef.current ||
-      !socket.connected ||
-      socket.id.localeCompare(peerId) >= 0 ||
-      offerInProgressRef.current.has(peerId)
-    ) {
-      return;
-    }
-
-    const pc = createPeerConnection(peerId);
-
-    if (pc.signalingState !== "stable") return;
-
-    offerInProgressRef.current.add(peerId);
-
-    try {
-      const offer = await pc.createOffer();
-
-      await pc.setLocalDescription(offer);
-
+  const startOffer = useCallback(
+    async (peerId) => {
       if (
+        !localStreamRef.current ||
         !voiceEnabledRef.current ||
         !socket.connected ||
-        peerConnectionsRef.current.get(peerId) !== pc
+        socket.id.localeCompare(peerId) >= 0 ||
+        offerInProgressRef.current.has(peerId)
       ) {
         return;
       }
 
-      socket.emit("voiceSignal", {
-        targetSocketId: peerId,
-        signal: {
-          type: "offer",
-          description: pc.localDescription,
-        },
-      });
-    } catch (error) {
-      console.error("Could not start voice connection:", error);
+      const pc = createPeerConnection(peerId);
 
-      setVoiceError(
-        "Could not connect to a colleague."
-      );
-    } finally {
-      offerInProgressRef.current.delete(peerId);
-    }
-  }, [createPeerConnection]);
+      if (pc.signalingState !== "stable") return;
+
+      offerInProgressRef.current.add(peerId);
+
+      try {
+        const offer = await pc.createOffer();
+
+        await pc.setLocalDescription(offer);
+
+        if (
+          !voiceEnabledRef.current ||
+          !socket.connected ||
+          peerConnectionsRef.current.get(peerId) !== pc
+        ) {
+          return;
+        }
+
+        socket.emit("voiceSignal", {
+          targetSocketId: peerId,
+          signal: {
+            type: "offer",
+            description: pc.localDescription,
+          },
+        });
+      } catch (error) {
+        console.error(
+          "Could not start voice connection:",
+          error
+        );
+
+        setVoiceError(
+          "Could not connect to a colleague."
+        );
+      } finally {
+        offerInProgressRef.current.delete(peerId);
+      }
+    },
+    [createPeerConnection]
+  );
 
   // ==========================================
   // HANDLE INCOMING WEBRTC SIGNALS
@@ -291,7 +471,9 @@ function VirtualOffice({
         const pc = createPeerConnection(fromSocketId);
 
         if (signal.type === "offer") {
-          await pc.setRemoteDescription(signal.description);
+          await pc.setRemoteDescription(
+            signal.description
+          );
 
           const queued =
             pendingCandidatesRef.current.get(fromSocketId) || [];
@@ -314,9 +496,13 @@ function VirtualOffice({
             },
           });
         } else if (signal.type === "answer") {
-          if (pc.signalingState !== "have-local-offer") return;
+          if (pc.signalingState !== "have-local-offer") {
+            return;
+          }
 
-          await pc.setRemoteDescription(signal.description);
+          await pc.setRemoteDescription(
+            signal.description
+          );
 
           const queued =
             pendingCandidatesRef.current.get(fromSocketId) || [];
@@ -346,7 +532,10 @@ function VirtualOffice({
           }
         }
       } catch (error) {
-        console.error("WebRTC signaling error:", error);
+        console.error(
+          "WebRTC signaling error:",
+          error
+        );
 
         setVoiceError(
           "A voice connection failed. Try leaving and rejoining voice."
@@ -438,8 +627,6 @@ function VirtualOffice({
   // ==========================================
 
   useEffect(() => {
-    // A room transition ends all peer connections
-    // from the previous room.
     for (const peerId of peerConnectionsRef.current.keys()) {
       closePeerConnection(peerId);
     }
@@ -461,27 +648,38 @@ function VirtualOffice({
   // ==========================================
 
   useEffect(() => {
-    const nearbyIds = new Set(
-      roomNearbyEmployees.map((employee) => employee.socketId)
+    const permittedPeerIds = new Set(
+      roomVoicePeers.map(
+        (employee) => employee.socketId
+      )
     );
 
-    // Close connections to employees who are no longer
-    // valid voice participants in this room.
+    // Close connections that are no longer permitted
+    // by the server's mutual voice-range calculation.
     for (const peerId of peerConnectionsRef.current.keys()) {
-      if (!nearbyIds.has(peerId)) {
+      if (!permittedPeerIds.has(peerId)) {
+        if (socket.connected) {
+          socket.emit("voiceSignal", {
+            targetSocketId: peerId,
+            signal: {
+              type: "voice-left",
+            },
+          });
+        }
+
         closePeerConnection(peerId);
       }
     }
 
     for (const peerId of announcedPeersRef.current) {
-      if (!nearbyIds.has(peerId)) {
+      if (!permittedPeerIds.has(peerId)) {
         announcedPeersRef.current.delete(peerId);
       }
     }
 
-    // Announce voice availability to the current room.
+    // Announce voice availability only to permitted peers.
     if (voiceEnabledRef.current && socket.connected) {
-      roomNearbyEmployees.forEach((employee) => {
+      roomVoicePeers.forEach((employee) => {
         const peerId = employee.socketId;
 
         if (
@@ -503,7 +701,7 @@ function VirtualOffice({
       });
     }
   }, [
-    roomNearbyEmployees,
+    roomVoicePeers,
     activeRoom,
     closePeerConnection,
   ]);
@@ -514,7 +712,9 @@ function VirtualOffice({
 
   const joinVoice = useCallback(async () => {
     if (!socket.connected) {
-      setVoiceError("Connect to the virtual office first.");
+      setVoiceError(
+        "Connect to the virtual office first."
+      );
       return;
     }
 
@@ -529,14 +729,15 @@ function VirtualOffice({
         );
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      });
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
 
       if (!socket.connected) {
         stream.getTracks().forEach((track) => track.stop());
@@ -555,7 +756,8 @@ function VirtualOffice({
 
       announcedPeersRef.current.clear();
 
-      nearbyRef.current.forEach((employee) => {
+      // Announce only to peers permitted by the server.
+      voicePeersRef.current.forEach((employee) => {
         const peerId = employee.socketId;
 
         if (!peerId || peerId === socket.id) return;
@@ -570,7 +772,10 @@ function VirtualOffice({
         });
       });
     } catch (error) {
-      console.error("Microphone access failed:", error);
+      console.error(
+        "Microphone access failed:",
+        error
+      );
 
       setVoiceError(
         error.name === "NotAllowedError"
@@ -680,130 +885,137 @@ function VirtualOffice({
   // MOUSE DOUBLE-CLICK MOVEMENT
   // ==========================================
 
-  const handleOfficeDoubleClick = useCallback((event) => {
-    if (!isActive || !socket.connected) return;
+  const handleOfficeDoubleClick = useCallback(
+    (event) => {
+      if (!isActive || !socket.connected) return;
 
-    const currentEmployee = roomEmployees.find(
-      (employee) => employee.socketId === myEmployeeId
-    );
+      const currentEmployee = roomEmployees.find(
+        (employee) => employee.socketId === myEmployeeId
+      );
 
-    if (!currentEmployee) return;
+      if (!currentEmployee) return;
 
-    const rect = event.currentTarget.getBoundingClientRect();
+      const rect =
+        event.currentTarget.getBoundingClientRect();
 
-    if (!rect.width || !rect.height) return;
+      if (!rect.width || !rect.height) return;
 
-    // Convert clicked screen position to office coordinates.
-    const clickX =
-      ((event.clientX - rect.left) / rect.width) * 100;
+      // Convert clicked screen position to office coordinates.
+      const clickX =
+        ((event.clientX - rect.left) / rect.width) * 100;
 
-    const clickY =
-      ((event.clientY - rect.top) / rect.height) * 100;
+      const clickY =
+        ((event.clientY - rect.top) / rect.height) * 100;
 
-    const targetX = Math.max(
-      20,
-      Math.min(780, ((clickX - 9.2) / 81) * 800)
-    );
+      const targetX = Math.max(
+        20,
+        Math.min(780, ((clickX - 9.2) / 81) * 800)
+      );
 
-    const targetY = Math.max(
-      20,
-      Math.min(480, ((clickY - 6.5) / 86) * 500)
-    );
+      const targetY = Math.max(
+        20,
+        Math.min(480, ((clickY - 6.5) / 86) * 500)
+      );
 
-    // Stop the previous movement if a new destination is selected.
-    stopMouseMovement();
+      stopMouseMovement();
 
-    const startingPosition = mousePositionRef.current || {
-      x: currentEmployee.x,
-      y: currentEmployee.y,
-    };
+      const startingPosition =
+        mousePositionRef.current || {
+          x: currentEmployee.x,
+          y: currentEmployee.y,
+        };
 
-    let currentX = startingPosition.x;
-    let currentY = startingPosition.y;
+      let currentX = startingPosition.x;
+      let currentY = startingPosition.y;
 
-    let previousTimestamp = 0;
-    let lastEmitTimestamp = 0;
+      let previousTimestamp = 0;
+      let lastEmitTimestamp = 0;
 
-    // Movement speed in office coordinates per second.
-    const movementSpeed = 260;
+      const movementSpeed = 260;
 
-    function animateMovement(timestamp) {
-      if (!socket.connected) {
-        mouseMovementRef.current = null;
-        return;
-      }
+      function animateMovement(timestamp) {
+        if (!socket.connected) {
+          mouseMovementRef.current = null;
+          return;
+        }
 
-      if (!previousTimestamp) {
+        if (!previousTimestamp) {
+          previousTimestamp = timestamp;
+        }
+
+        const deltaTime = Math.min(
+          (timestamp - previousTimestamp) / 1000,
+          0.05
+        );
+
         previousTimestamp = timestamp;
-      }
 
-      const deltaTime = Math.min(
-        (timestamp - previousTimestamp) / 1000,
-        0.05
-      );
+        const differenceX = targetX - currentX;
+        const differenceY = targetY - currentY;
 
-      previousTimestamp = timestamp;
+        const distance = Math.sqrt(
+          differenceX * differenceX +
+          differenceY * differenceY
+        );
 
-      const differenceX = targetX - currentX;
-      const differenceY = targetY - currentY;
+        const movementStep =
+          movementSpeed * deltaTime;
 
-      const distance = Math.sqrt(
-        differenceX * differenceX +
-        differenceY * differenceY
-      );
+        if (
+          distance <= movementStep ||
+          distance < 0.5
+        ) {
+          currentX = targetX;
+          currentY = targetY;
 
-      const movementStep = movementSpeed * deltaTime;
+          mousePositionRef.current = {
+            x: currentX,
+            y: currentY,
+          };
 
-      // Reached destination.
-      if (distance <= movementStep || distance < 0.5) {
-        currentX = targetX;
-        currentY = targetY;
+          socket.emit("employeeMove", {
+            x: currentX,
+            y: currentY,
+          });
+
+          mouseMovementRef.current = null;
+          return;
+        }
+
+        currentX +=
+          (differenceX / distance) * movementStep;
+
+        currentY +=
+          (differenceY / distance) * movementStep;
 
         mousePositionRef.current = {
           x: currentX,
           y: currentY,
         };
 
-        socket.emit("employeeMove", {
-          x: currentX,
-          y: currentY,
-        });
+        if (timestamp - lastEmitTimestamp >= 33) {
+          socket.emit("employeeMove", {
+            x: currentX,
+            y: currentY,
+          });
 
-        mouseMovementRef.current = null;
-        return;
-      }
+          lastEmitTimestamp = timestamp;
+        }
 
-      // Move gradually towards the destination.
-      currentX += (differenceX / distance) * movementStep;
-      currentY += (differenceY / distance) * movementStep;
-
-      mousePositionRef.current = {
-        x: currentX,
-        y: currentY,
-      };
-
-      // Broadcast approximately 30 updates per second.
-      if (timestamp - lastEmitTimestamp >= 33) {
-        socket.emit("employeeMove", {
-          x: currentX,
-          y: currentY,
-        });
-
-        lastEmitTimestamp = timestamp;
+        mouseMovementRef.current =
+          requestAnimationFrame(animateMovement);
       }
 
       mouseMovementRef.current =
         requestAnimationFrame(animateMovement);
-    }
-
-    mouseMovementRef.current =
-      requestAnimationFrame(animateMovement);
-  }, [
-    isActive,
-    roomEmployees,
-    myEmployeeId,
-    stopMouseMovement,
-  ]);
+    },
+    [
+      isActive,
+      roomEmployees,
+      myEmployeeId,
+      stopMouseMovement,
+    ]
+  );
 
   // ==========================================
   // CLEAN UP MOUSE MOVEMENT
@@ -816,14 +1028,17 @@ function VirtualOffice({
     return () => {
       stopMouseMovement();
     };
-  }, [activeRoom, isActive, stopMouseMovement]);
+  }, [
+    activeRoom,
+    isActive,
+    stopMouseMovement,
+  ]);
 
   // ==========================================
   // KEYBOARD MOVEMENT
   // ==========================================
 
   useEffect(() => {
-    // Do not allow office movement from other pages.
     if (!isActive) return;
 
     function handleKeyDown(event) {
@@ -845,14 +1060,22 @@ function VirtualOffice({
       if (
         event.target instanceof HTMLElement &&
         (
-          ["INPUT", "TEXTAREA"].includes(event.target.tagName) ||
+          ["INPUT", "TEXTAREA"].includes(
+            event.target.tagName
+          ) ||
           event.target.isContentEditable
         )
       ) {
         return;
       }
 
-      if (event.ctrlKey || event.altKey || event.metaKey) return;
+      if (
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey
+      ) {
+        return;
+      }
 
       const currentEmployee = roomEmployees.find(
         (employee) => employee.socketId === myEmployeeId
@@ -860,14 +1083,14 @@ function VirtualOffice({
 
       if (!currentEmployee || !socket.connected) return;
 
-      // Keyboard input takes control from mouse movement.
       stopMouseMovement();
 
       event.preventDefault();
 
       const speed = 12;
 
-      let { x, y } = mousePositionRef.current || currentEmployee;
+      let { x, y } =
+        mousePositionRef.current || currentEmployee;
 
       if (key === "w" || key === "arrowup") y -= speed;
       if (key === "s" || key === "arrowdown") y += speed;
@@ -885,7 +1108,10 @@ function VirtualOffice({
     window.addEventListener("keydown", handleKeyDown);
 
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener(
+        "keydown",
+        handleKeyDown
+      );
     };
   }, [
     roomEmployees,
@@ -921,7 +1147,8 @@ function VirtualOffice({
 
         <div className="player-layer">
           {roomEmployees.map((employee) => {
-            const isMe = employee.socketId === myEmployeeId;
+            const isMe =
+              employee.socketId === myEmployeeId;
 
             const initials = (employee.name || "Guest")
               .split(" ")
@@ -931,12 +1158,24 @@ function VirtualOffice({
               .toUpperCase();
 
             const isNearby = roomNearbyEmployees.some(
-              (nearby) => nearby.socketId === employee.socketId
+              (nearby) =>
+                nearby.socketId === employee.socketId
             );
+
+            // Each employee uses their own selected range.
+            const employeeVoiceRange =
+              employee.voiceRange === 75 ? 75 : 120;
+
+            // Diameter = 2 × radius.
+            // The office is 800 virtual pixels wide.
+            const voiceCircleDiameter =
+              (employeeVoiceRange * 2 / 800) * 100;
 
             return (
               <div
-                key={employee.socketId || employee.userId}
+                key={
+                  employee.socketId || employee.userId
+                }
                 className="player"
                 style={{
                   left: `${9.2 + (employee.x / 800) * 81}%`,
@@ -946,13 +1185,13 @@ function VirtualOffice({
                 <div
                   className="avatar-voice-wrapper"
                   style={{
-                    "--voice-range-size": `${(voiceRange * 200) / 1536}cqi`,
+                    "--voice-range-size":
+                      `${voiceCircleDiameter}cqi`,
                   }}
                 >
                   {/* Proximity visuals are only needed in Workspace. */}
                   {!isGroupRoom && (
                     <>
-
                       <div className="ocean-wave" />
                       <div className="ocean-wave" />
                       <div className="ocean-wave" />
@@ -963,7 +1202,9 @@ function VirtualOffice({
 
                   <div
                     className={`avatar ${
-                      isMe ? "my-avatar" : "other-avatar"
+                      isMe
+                        ? "my-avatar"
+                        : "other-avatar"
                     }`}
                     title={
                       isGroupRoom
@@ -988,25 +1229,17 @@ function VirtualOffice({
 
       {/* Remote audio elements stay mounted while navigating pages. */}
       <div className="office-audio-elements">
-        {Object.entries(remoteStreams).map(([peerId, stream]) => (
-          <audio
-            key={peerId}
-            autoPlay
-            playsInline
-            ref={(element) => {
-              if (element && element.srcObject !== stream) {
-                element.srcObject = stream;
-
-                element.play().catch((error) => {
-                  console.warn(
-                    "Audio playback needs browser permission:",
-                    error
-                  );
-                });
-              }
-            }}
-          />
-        ))}
+        {Object.entries(remoteStreams).map(
+          ([peerId, stream]) => (
+            <audio
+              key={peerId}
+              ref={getAudioRef(peerId)}
+              autoPlay
+              playsInline
+              data-peer-id={peerId}
+            />
+          )
+        )}
       </div>
     </main>
   );

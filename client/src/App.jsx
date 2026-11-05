@@ -20,6 +20,9 @@ const ROOM_NAMES = {
   meeting2: "Meeting Room 02",
 };
 
+const DEFAULT_VOICE_RANGE = 120;
+const VOICE_RANGE_STORAGE_KEY = "proxispeak_voice_range";
+
 const INITIAL_VOICE_CONTROLS = {
   voiceJoined: false,
   muted: false,
@@ -30,6 +33,20 @@ const INITIAL_VOICE_CONTROLS = {
   onToggleMute: () => {},
   onLeaveVoice: () => {},
 };
+
+function getSavedVoiceRange() {
+  try {
+    const savedRange = Number(
+      localStorage.getItem(VOICE_RANGE_STORAGE_KEY)
+    );
+
+    return savedRange === 75 || savedRange === 120
+      ? savedRange
+      : DEFAULT_VOICE_RANGE;
+  } catch {
+    return DEFAULT_VOICE_RANGE;
+  }
+}
 
 function App() {
   const [user, setUser] = useState(null);
@@ -51,7 +68,17 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [employees, setEmployees] = useState([]);
   const [nearbyEmployees, setNearbyEmployees] = useState([]);
-  const [voiceRange, setVoiceRange] = useState(120);
+
+  // All employees requiring a WebRTC connection.
+  const [voicePeers, setVoicePeers] = useState([]);
+
+  const [voiceRange, setVoiceRange] = useState(DEFAULT_VOICE_RANGE);
+
+  // User's saved Main Workspace voice preference.
+  const [voiceRangePreference, setVoiceRangePreference] =
+    useState(getSavedVoiceRange);
+
+  const voiceRangePreferenceRef = useRef(voiceRangePreference);
 
   // Global voice controls managed by persistent VirtualOffice.
   const [voiceControls, setVoiceControls] = useState(
@@ -60,6 +87,37 @@ function App() {
 
   const handleVoiceControlsChange = useCallback((controls) => {
     setVoiceControls(controls);
+  }, []);
+
+  // Keep the preference ref synchronized.
+  useEffect(() => {
+    voiceRangePreferenceRef.current = voiceRangePreference;
+  }, [voiceRangePreference]);
+
+  // Update the saved Workspace voice preference.
+  const handleVoiceRangeChange = useCallback((newRange) => {
+    const selectedRange = Number(newRange);
+
+    if (selectedRange !== 75 && selectedRange !== 120) {
+      return;
+    }
+
+    setVoiceRangePreference(selectedRange);
+
+    try {
+      localStorage.setItem(
+        VOICE_RANGE_STORAGE_KEY,
+        String(selectedRange)
+      );
+    } catch (error) {
+      console.warn("Could not save voice range preference:", error);
+    }
+
+    if (socket.connected) {
+      socket.emit("setVoiceRange", {
+        voiceRange: selectedRange,
+      });
+    }
   }, []);
 
   // Global temporary chat messages.
@@ -86,7 +144,6 @@ function App() {
       const targetPage = event.state?.page || "VirtualOffice";
       const targetRoom = event.state?.roomId || "workspace";
 
-      // Prevent browser Back from bypassing room confirmation.
       if (targetRoom !== currentRoomRef.current) {
         window.history.pushState(
           {
@@ -105,7 +162,6 @@ function App() {
         return;
       }
 
-      // Normal browser navigation within the same room.
       pendingHistoryPageRef.current = null;
       setCurrentPage(targetPage);
     }
@@ -125,6 +181,7 @@ function App() {
       setConnected(false);
       setEmployees([]);
       setNearbyEmployees([]);
+      setVoicePeers([]);
       setMessages([]);
 
       return;
@@ -136,13 +193,20 @@ function App() {
 
     function handleConnect() {
       console.log("Authenticated Socket.IO connection established.");
+
       setConnected(true);
+
+      socket.emit("setVoiceRange", {
+        voiceRange: voiceRangePreferenceRef.current,
+      });
     }
 
     function handleDisconnect() {
       setConnected(false);
       setEmployees([]);
       setNearbyEmployees([]);
+      setVoicePeers([]);
+      setVoiceRange(DEFAULT_VOICE_RANGE);
     }
 
     function handleEmployeesUpdate(updatedEmployees) {
@@ -163,8 +227,15 @@ function App() {
     function handleProximityUpdate(data = {}) {
       setNearbyEmployees(data.nearbyEmployees || []);
 
-      if (Number.isFinite(data.voiceRange)) {
-        setVoiceRange(data.voiceRange);
+      // All peers that require WebRTC connections.
+      setVoicePeers(data.voicePeers || []);
+
+      if (data.voiceMode === "proximity") {
+        if (Number.isFinite(data.voiceRange)) {
+          setVoiceRange(data.voiceRange);
+        }
+      } else if (data.voiceMode === "group") {
+        setVoiceRange(null);
       }
     }
 
@@ -285,6 +356,8 @@ function App() {
     setConnected(false);
     setEmployees([]);
     setNearbyEmployees([]);
+    setVoicePeers([]);
+    setVoiceRange(DEFAULT_VOICE_RANGE);
 
     setVoiceControls(INITIAL_VOICE_CONTROLS);
 
@@ -292,7 +365,6 @@ function App() {
   }
 
   // Normal application navigation.
-  // This does not trigger room-switch confirmation.
   function handleNavigate(page) {
     if (page === currentPageRef.current) return;
 
@@ -316,7 +388,6 @@ function App() {
       return;
     }
 
-    // No confirmation when selecting the current room.
     if (roomId === currentRoomRef.current) {
       return;
     }
@@ -380,17 +451,12 @@ function App() {
             ? confirmedRoom
             : destinationRoom;
 
-        // Update the room immediately.
         currentRoomRef.current = finalRoom;
         setCurrentRoom(finalRoom);
 
-        // IMPORTANT:
-        // Every successful room transition opens VirtualOffice.
-        // It does not matter which page the user came from.
         currentPageRef.current = "VirtualOffice";
         setCurrentPage("VirtualOffice");
 
-        // Update the current history entry to the destination room.
         window.history.replaceState(
           {
             page: "VirtualOffice",
@@ -400,7 +466,6 @@ function App() {
           window.location.pathname
         );
 
-        // Clear any pending browser-history navigation.
         pendingHistoryPageRef.current = null;
 
         setPendingRoom(null);
@@ -457,7 +522,13 @@ function App() {
       break;
 
     case "Settings":
-      currentPageComponent = <Settings {...pageProps} />;
+      currentPageComponent = (
+        <Settings
+          {...pageProps}
+          voiceRangePreference={voiceRangePreference}
+          onVoiceRangeChange={handleVoiceRangeChange}
+        />
+      );
       break;
 
     case "VirtualOffice":
@@ -478,7 +549,9 @@ function App() {
         connected,
         employees,
         nearbyEmployees,
+        voicePeers,
         voiceRange,
+        voiceRangePreference,
         currentRoom,
 
         onRequestRoomChange: handleRequestRoomChange,

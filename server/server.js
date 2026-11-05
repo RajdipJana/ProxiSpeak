@@ -46,7 +46,9 @@ const PORT = process.env.PORT || 5000;
 const OFFICE_WIDTH = 800;
 const OFFICE_HEIGHT = 500;
 
-const VOICE_RANGE = 120;
+const DEFAULT_VOICE_RANGE = 120;
+const ALLOWED_VOICE_RANGES = [75, 120];
+
 const TARGET_QUERY_TIME_MS = 20;
 const CLUSTER_DISTANCE_PIXELS = 100;
 
@@ -104,17 +106,6 @@ function getRoomInfo(roomId) {
 const employees = new Map();
 
 // Employee positions are stored separately for each room.
-//
-// Structure:
-// employeePositions = Map {
-//   employeeId: {
-//     workspace: { x, y },
-//     conference: { x, y },
-//     meeting1: { x, y },
-//     meeting2: { x, y }
-//   }
-// }
-
 const employeePositions = new Map();
 
 // ==========================================
@@ -215,6 +206,48 @@ function distanceBetweenEmployees(employee1, employee2) {
 }
 
 // ==========================================
+// VOICE RANGE PERMISSION
+// ==========================================
+
+// Main Workspace only.
+//
+// Both employees must be within the smaller of their
+// selected ranges before a WebRTC connection is allowed.
+//
+// 75px + 75px  = 75px
+// 75px + 120px = 75px
+// 120px + 120px = 120px
+
+function canEmployeesConnectByProximity(employee1, employee2) {
+  if (
+    !employee1 ||
+    !employee2 ||
+    employee1.currentRoom !== employee2.currentRoom
+  ) {
+    return false;
+  }
+
+  const roomInfo = getRoomInfo(employee1.currentRoom);
+
+  // Group rooms do not use proximity restrictions.
+  if (roomInfo.voiceMode === "group") {
+    return true;
+  }
+
+  const mutualRange = Math.min(
+    employee1.voiceRange,
+    employee2.voiceRange
+  );
+
+  const distance = distanceBetweenEmployees(
+    employee1,
+    employee2
+  );
+
+  return distance <= mutualRange;
+}
+
+// ==========================================
 // COLLISION DETECTION
 // ROOM-SPECIFIC
 // ==========================================
@@ -230,7 +263,6 @@ function isPositionAvailable(
       continue;
     }
 
-    // Employees in different rooms cannot collide.
     if (employee.currentRoom !== roomId) {
       continue;
     }
@@ -427,11 +459,10 @@ function resolveMovement(employee, targetX, targetY) {
 function broadcastEmployeeState() {
   const employeeList = Array.from(employees.values());
 
-  // Keep the global employee directory updated.
-  // Each employee includes their currentRoom.
+  // Update the global employee directory.
   io.emit("employeesUpdate", employeeList);
 
-  // Send room-aware proximity information.
+  // Send room-aware voice information to each employee.
   for (const socket of io.sockets.sockets.values()) {
     const currentEmployee = employees.get(socket.id);
 
@@ -447,47 +478,82 @@ function broadcastEmployeeState() {
           employee.socketId !== socket.id &&
           employee.currentRoom === currentEmployee.currentRoom
         );
-      });
+      })
+      .map((employee) => ({
+        ...employee,
 
-    let voiceParticipants;
+        distance: Number(
+          distanceBetweenEmployees(
+            currentEmployee,
+            employee
+          ).toFixed(2)
+        ),
+      }));
+
+    let nearbyEmployees;
+    let voicePeers;
 
     if (roomInfo.voiceMode === "proximity") {
-      // Workspace: only employees within 120 pixels.
-      voiceParticipants = sameRoomEmployees
-        .map((employee) => ({
-          ...employee,
-          distance: Number(
-            distanceBetweenEmployees(
-              currentEmployee,
-              employee
-            ).toFixed(2)
-          ),
-        }))
-        .filter(
-          (employee) => employee.distance <= VOICE_RANGE
-        );
-    } else {
-      // Meeting rooms: every employee in the same room.
-      voiceParticipants = sameRoomEmployees.map(
+      // ======================================
+      // MAIN WORKSPACE — MUTUAL RANGE
+      // ======================================
+
+      // A pair is included only when BOTH employees
+      // are within the smaller of their two ranges.
+
+      const mutuallyNearbyEmployees = sameRoomEmployees.filter(
+        (employee) => {
+          const mutualRange = Math.min(
+            currentEmployee.voiceRange,
+            employee.voiceRange
+          );
+
+          return employee.distance <= mutualRange;
+        }
+      );
+
+      nearbyEmployees = mutuallyNearbyEmployees.map(
         (employee) => ({
           ...employee,
-          distance: Number(
-            distanceBetweenEmployees(
-              currentEmployee,
-              employee
-            ).toFixed(2)
-          ),
+
+          youHearThem: true,
+          theyHearYou: true,
         })
       );
+
+      // WebRTC connections are created only for
+      // mutually permitted voice pairs.
+      voicePeers = nearbyEmployees;
+    } else {
+      // ======================================
+      // GROUP ROOMS — UNRESTRICTED VOICE
+      // ======================================
+
+      nearbyEmployees = sameRoomEmployees.map(
+        (employee) => ({
+          ...employee,
+
+          youHearThem: true,
+          theyHearYou: true,
+        })
+      );
+
+      voicePeers = nearbyEmployees;
     }
 
     socket.emit("proximityUpdate", {
-      nearbyEmployees: voiceParticipants,
+      nearbyEmployees,
+      voicePeers,
+
       voiceRange:
         roomInfo.voiceMode === "proximity"
-          ? VOICE_RANGE
+          ? currentEmployee.voiceRange
           : null,
+
+      voiceRangePreference: currentEmployee.voiceRange,
+
       currentRoom: currentEmployee.currentRoom,
+
       voiceMode: roomInfo.voiceMode,
     });
   }
@@ -500,6 +566,7 @@ function broadcastEmployeeState() {
 app.get("/", (req, res) => {
   res.json({
     success: true,
+
     message: "ProxiSpeak backend is running.",
 
     coordinateSystem: "Virtual office pixels (x, y)",
@@ -513,7 +580,9 @@ app.get("/", (req, res) => {
 
     defaultRoom: DEFAULT_ROOM,
 
-    voiceRangePixels: VOICE_RANGE,
+    defaultVoiceRangePixels: DEFAULT_VOICE_RANGE,
+
+    availableWorkspaceVoiceRanges: ALLOWED_VOICE_RANGES,
 
     collisionDistancePixels: COLLISION_DISTANCE,
 
@@ -670,9 +739,11 @@ app.get("/api/spatial-audit", (req, res) => {
 
         return {
           ...employee,
+
           distancePixels: Number(
             exactDistance.toFixed(2)
           ),
+
           exactDistance,
         };
       })
@@ -701,6 +772,7 @@ app.get("/api/spatial-audit", (req, res) => {
 
       while (queue.length > 0) {
         const currentIndex = queue.shift();
+
         const currentEmployee =
           nearbyEmployees[currentIndex];
 
@@ -773,8 +845,10 @@ app.get("/api/spatial-audit", (req, res) => {
         queryTimeMs,
         totalProcessingMs,
         targetMs: TARGET_QUERY_TIME_MS,
+
         queryWithinTarget:
           queryTimeMs < TARGET_QUERY_TIME_MS,
+
         totalWithinTarget:
           totalProcessingMs < TARGET_QUERY_TIME_MS,
       },
@@ -829,8 +903,7 @@ io.on("connection", (socket) => {
     );
 
     socket.emit("officeFull", {
-      message:
-        "The Workspace is currently full.",
+      message: "The Workspace is currently full.",
     });
 
     socket.disconnect(true);
@@ -853,6 +926,8 @@ io.on("connection", (socket) => {
 
     isVoiceActive: false,
     isMuted: false,
+
+    voiceRange: DEFAULT_VOICE_RANGE,
   };
 
   employees.set(socket.id, employee);
@@ -879,7 +954,6 @@ io.on("connection", (socket) => {
         ? payload.roomId
         : "";
 
-    // Validate the requested room.
     if (!isValidRoom(requestedRoom)) {
       const result = {
         success: false,
@@ -895,7 +969,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // No work is needed if the employee is already there.
     if (currentEmployee.currentRoom === requestedRoom) {
       const result = {
         success: true,
@@ -913,10 +986,8 @@ io.on("connection", (socket) => {
 
     const previousRoom = currentEmployee.currentRoom;
 
-    // Preserve the previous room's avatar position.
     saveEmployeePosition(currentEmployee);
 
-    // Restore the destination room's saved position.
     const savedDestinationPosition = getSavedPosition(
       currentEmployee.userId,
       requestedRoom
@@ -930,7 +1001,6 @@ io.on("connection", (socket) => {
       ? savedDestinationPosition.y
       : 250;
 
-    // Find a free position in the destination room.
     const destinationPosition = findFreePosition(
       preferredX,
       preferredY,
@@ -953,14 +1023,11 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Update room membership on the server.
     currentEmployee.currentRoom = requestedRoom;
 
     currentEmployee.x = destinationPosition.x;
     currentEmployee.y = destinationPosition.y;
 
-    // Reset voice status during the transition.
-    // The frontend will establish the new voice session.
     currentEmployee.isVoiceActive = false;
     currentEmployee.isMuted = false;
 
@@ -972,7 +1039,6 @@ io.on("connection", (socket) => {
       `${currentEmployee.name} switched from ${getRoomInfo(previousRoom).name} to ${getRoomInfo(requestedRoom).name}`
     );
 
-    // Update every connected employee's room state.
     broadcastEmployeeState();
 
     const result = {
@@ -987,7 +1053,6 @@ io.on("connection", (socket) => {
       employee: currentEmployee,
     };
 
-    // Notify the switching employee.
     socket.emit("roomChanged", result);
 
     if (typeof callback === "function") {
@@ -1027,6 +1092,7 @@ io.on("connection", (socket) => {
 
     saveEmployeePosition(currentEmployee);
 
+    // Recalculate mutual voice permissions after movement.
     broadcastEmployeeState();
   });
 
@@ -1074,12 +1140,46 @@ io.on("connection", (socket) => {
       timestamp: new Date().toISOString(),
     };
 
-    // Existing global office chat is preserved.
     io.emit("newMessage", chatMessage);
 
     console.log(
       `[Office Chat] ${currentEmployee.name} (${currentEmployee.userId}): ${messageText}`
     );
+  });
+
+  // ========================================
+  // MAIN WORKSPACE VOICE RANGE PREFERENCE
+  // ========================================
+
+  socket.on("setVoiceRange", (payload = {}) => {
+    const currentEmployee = employees.get(socket.id);
+
+    if (!currentEmployee) return;
+
+    const selectedRange = Number(payload.voiceRange);
+
+    if (!ALLOWED_VOICE_RANGES.includes(selectedRange)) {
+      socket.emit("voiceRangeError", {
+        message:
+          "Voice range must be either 75 or 120 pixels.",
+
+        allowedRanges: ALLOWED_VOICE_RANGES,
+      });
+
+      return;
+    }
+
+    currentEmployee.voiceRange = selectedRange;
+
+    employees.set(socket.id, currentEmployee);
+
+    console.log(
+      `${currentEmployee.name} selected ${selectedRange}px Main Workspace voice range.`
+    );
+
+    // Changing the range immediately recalculates
+    // all mutual voice permissions.
+    broadcastEmployeeState();
   });
 
   // ========================================
@@ -1114,28 +1214,63 @@ io.on("connection", (socket) => {
 
   // ========================================
   // WEBRTC VOICE SIGNALING
-  // ROOM-ISOLATED
+  // ROOM-ISOLATED + RANGE-VALIDATED
   // ========================================
 
   socket.on("voiceSignal", (payload = {}) => {
     const { targetSocketId, signal } = payload;
 
     const sender = employees.get(socket.id);
-    const target = employees.get(targetSocketId);
 
     if (
       !sender ||
-      !target ||
       typeof targetSocketId !== "string" ||
       !signal ||
+      typeof signal !== "object" ||
+      Array.isArray(signal) ||
       targetSocketId === socket.id
     ) {
       return;
     }
 
+    const target = employees.get(targetSocketId);
+
+    if (!target) return;
+
     // Never relay WebRTC signals between different rooms.
     if (sender.currentRoom !== target.currentRoom) {
       return;
+    }
+
+    const allowedSignalTypes = [
+      "voice-ready",
+      "voice-ready-ack",
+      "voice-left",
+      "offer",
+      "answer",
+      "candidate",
+    ];
+
+    if (
+      typeof signal.type !== "string" ||
+      !allowedSignalTypes.includes(signal.type)
+    ) {
+      return;
+    }
+
+    // voice-left is allowed even after the pair moves
+    // outside the permitted range, so the other client
+    // can clean up its existing WebRTC connection.
+    if (signal.type !== "voice-left") {
+      const roomInfo = getRoomInfo(sender.currentRoom);
+
+      // Main Workspace requires mutual range permission.
+      if (
+        roomInfo.voiceMode === "proximity" &&
+        !canEmployeesConnectByProximity(sender, target)
+      ) {
+        return;
+      }
     }
 
     io.to(targetSocketId).emit("voiceSignal", {
@@ -1152,7 +1287,6 @@ io.on("connection", (socket) => {
     const disconnectedEmployee = employees.get(socket.id);
 
     if (disconnectedEmployee) {
-      // Preserve the employee's current room position.
       saveEmployeePosition(disconnectedEmployee);
     }
 
@@ -1227,7 +1361,9 @@ async function startServer() {
         `Virtual office: ${OFFICE_WIDTH} x ${OFFICE_HEIGHT} pixels`
       );
 
-      console.log(`Voice range: ${VOICE_RANGE} pixels`);
+      console.log(
+        `Workspace voice ranges: ${ALLOWED_VOICE_RANGES.join("px / ")}px`
+      );
 
       console.log(
         `Collision distance: ${COLLISION_DISTANCE} pixels`
@@ -1241,7 +1377,7 @@ async function startServer() {
       console.log("Available rooms:", Object.keys(ROOMS).join(", "));
 
       console.log(
-        "Workspace voice: 120px proximity"
+        "Workspace voice: mutual 75px / 120px proximity"
       );
 
       console.log(

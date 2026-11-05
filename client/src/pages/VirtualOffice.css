@@ -3,6 +3,16 @@
    VIRTUAL OFFICE — VOICE RANGE ANIMATIONS
 ========================================= */
 
+/* Reference container for voice circle sizing */
+
+.office-stage {
+  container-type: inline-size;
+}
+
+/* =========================================
+   AVATAR VOICE WRAPPER
+========================================= */
+
 .avatar-voice-wrapper {
   position: relative;
   width: 48px;
@@ -15,90 +25,98 @@
 }
 
 /* =========================================
-   THREE SIMULTANEOUS EXPANDING RINGS
+   SINGLE EXPANDING SONAR WAVE
 ========================================= */
 
 .ocean-wave {
   position: absolute;
   top: 50%;
   left: 50%;
+
   width: var(--voice-range-size);
   height: var(--voice-range-size);
-  border: 3px solid rgba(3, 61, 109, 0.959);
+
+  border: 1px solid rgba(0, 195, 255, 0.45);
   border-radius: 50%;
-  transform: translate(-50%, -50%) scale(0);
+
+  transform: translate(-50%, -50%) scale(0.02);
   opacity: 0;
+
+  box-shadow:
+    0 0 5px rgba(0, 195, 255, 0.18);
+
   pointer-events: none;
   z-index: 1;
 
-  /* All three rings share the same animation. */
-  animation: sonarWave 4s ease-out infinite;
-}
-
-/* Three different starting sizes, synchronized. */
-
-.ocean-wave:nth-of-type(1) {
-  animation-delay: 0s;
-  animation-name: sonarWave;
-  
-}
-
-.ocean-wave:nth-of-type(2) {
-  animation-delay: 0s;
-  animation-name: sonarWaveSecond;
-}
-
-.ocean-wave:nth-of-type(3) {
-  animation-delay: 0s;
-  animation-name: sonarWaveThird;
+  /* One wave every 5 seconds */
+  animation: sonarWave 5s ease-out infinite;
 }
 
 /* =========================================
-   AVATAR GLOW
+   SUBTLE GLOW EFFECT
 ========================================= */
 
 .ocean-glow {
   position: absolute;
   top: 50%;
   left: 50%;
+
   width: var(--voice-range-size);
   height: var(--voice-range-size);
-  transform: translate(-50%, -50%);
+
   border-radius: 50%;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    rgba(0, 210, 255, 0.08) 45deg,
-    transparent 100deg,
-    rgba(30, 100, 255, 0.06) 180deg,
-    transparent 240deg,
-    rgba(0, 210, 255, 0.07) 300deg,
-    transparent 360deg
+
+  transform: translate(-50%, -50%) scale(0.02);
+  opacity: 0;
+
+  background: radial-gradient(
+    circle,
+    transparent 40%,
+    rgba(0, 195, 255, 0.06) 100%
   );
+
   filter: blur(5px);
-  animation: oceanRotate 14s linear infinite;
+
   pointer-events: none;
   z-index: 0;
+
+  animation: sonarGlow 5s ease-out infinite;
 }
 
-/* Avatar remains above the waves. */
+/* =========================================
+   AVATAR LAYER
+========================================= */
 
 .avatar-voice-wrapper .avatar {
   position: relative;
   z-index: 2;
+
   box-shadow:
     0 0 0 2px rgba(0, 210, 255, 0.18),
     0 0 12px rgba(0, 180, 255, 0.18);
 }
 
 /* =========================================
-   WAVE ANIMATIONS
+   SONAR WAVE ANIMATION
 ========================================= */
 
 @keyframes sonarWave {
   0% {
     transform: translate(-50%, -50%) scale(0.02);
-    opacity: 0.8;
+    opacity: 0;
+  }
+
+  5% {
+    opacity: 0.45;
+  }
+
+  30% {
+    opacity: 0.25;
+  }
+
+  35% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0;
   }
 
   100% {
@@ -107,51 +125,42 @@
   }
 }
 
-@keyframes sonarWaveSecond {
+/* =========================================
+   SUBTLE GLOW ANIMATION
+========================================= */
+
+@keyframes sonarGlow {
   0% {
     transform: translate(-50%, -50%) scale(0.02);
-    opacity: 0.8;
-  }
-
-  100% {
-    transform: translate(-50%, -50%) scale(0.72);
     opacity: 0;
   }
-}
 
-@keyframes sonarWaveThird {
-  0% {
-    transform: translate(-50%, -50%) scale(0.02);
-    opacity: 0.8;
+  5% {
+    opacity: 0.2;
+  }
+
+  35% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0;
   }
 
   100% {
-    transform: translate(-50%, -50%) scale(0.44);
+    transform: translate(-50%, -50%) scale(1);
     opacity: 0;
   }
 }
 
 /* =========================================
-   GLOW ANIMATION
+   REMOTE AUDIO ELEMENTS
 ========================================= */
-
-@keyframes oceanRotate {
-  from {
-    transform: translate(-50%, -50%) rotate(0deg);
-  }
-
-  to {
-    transform: translate(-50%, -50%) rotate(360deg);
-  }
-}
-
-/* Keep remote audio active without displaying controls. */
 
 .office-audio-elements {
   display: none;
 }
 
-/* Respect reduced-motion preferences. */
+/* =========================================
+   REDUCED MOTION ACCESSIBILITY
+========================================= */
 
 @media (prefers-reduced-motion: reduce) {
   .ocean-wave,
