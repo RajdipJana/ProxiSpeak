@@ -48,6 +48,7 @@ input {
   aspect-ratio: 3 / 2;
   overflow: hidden;
   isolation: isolate;
+  container-type: inline-size;
   background: #101e2b;
 }
 

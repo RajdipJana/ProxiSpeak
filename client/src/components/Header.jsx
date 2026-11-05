@@ -440,6 +440,8 @@ function Header({
 
           <span className="or-label">or</span>
           <span className="arrow-keys">↑ ↓ ← →</span>
+          <span className="or-label">or</span>
+          <span className="mouse">Double click to move</span>
         </div>
       </div>
     </header>

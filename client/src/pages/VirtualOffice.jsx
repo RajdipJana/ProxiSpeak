@@ -1,3 +1,4 @@
+
 import Header from "../components/Header";
 import {
   useState,
@@ -52,6 +53,10 @@ function VirtualOffice({
   const [muted, setMuted] = useState(false);
   const [voiceError, setVoiceError] = useState("");
   const [remoteStreams, setRemoteStreams] = useState({});
+
+  // Mouse-based movement refs
+  const mouseMovementRef = useRef(null);
+  const mousePositionRef = useRef(null);
 
   // Room configuration
   const activeRoom = ROOM_BACKGROUNDS[currentRoom]
@@ -661,6 +666,159 @@ function VirtualOffice({
   ]);
 
   // ==========================================
+  // STOP MOUSE MOVEMENT
+  // ==========================================
+
+  const stopMouseMovement = useCallback(() => {
+    if (mouseMovementRef.current !== null) {
+      cancelAnimationFrame(mouseMovementRef.current);
+      mouseMovementRef.current = null;
+    }
+  }, []);
+
+  // ==========================================
+  // MOUSE DOUBLE-CLICK MOVEMENT
+  // ==========================================
+
+  const handleOfficeDoubleClick = useCallback((event) => {
+    if (!isActive || !socket.connected) return;
+
+    const currentEmployee = roomEmployees.find(
+      (employee) => employee.socketId === myEmployeeId
+    );
+
+    if (!currentEmployee) return;
+
+    const rect = event.currentTarget.getBoundingClientRect();
+
+    if (!rect.width || !rect.height) return;
+
+    // Convert clicked screen position to office coordinates.
+    const clickX =
+      ((event.clientX - rect.left) / rect.width) * 100;
+
+    const clickY =
+      ((event.clientY - rect.top) / rect.height) * 100;
+
+    const targetX = Math.max(
+      20,
+      Math.min(780, ((clickX - 9.2) / 81) * 800)
+    );
+
+    const targetY = Math.max(
+      20,
+      Math.min(480, ((clickY - 6.5) / 86) * 500)
+    );
+
+    // Stop the previous movement if a new destination is selected.
+    stopMouseMovement();
+
+    const startingPosition = mousePositionRef.current || {
+      x: currentEmployee.x,
+      y: currentEmployee.y,
+    };
+
+    let currentX = startingPosition.x;
+    let currentY = startingPosition.y;
+
+    let previousTimestamp = 0;
+    let lastEmitTimestamp = 0;
+
+    // Movement speed in office coordinates per second.
+    const movementSpeed = 260;
+
+    function animateMovement(timestamp) {
+      if (!socket.connected) {
+        mouseMovementRef.current = null;
+        return;
+      }
+
+      if (!previousTimestamp) {
+        previousTimestamp = timestamp;
+      }
+
+      const deltaTime = Math.min(
+        (timestamp - previousTimestamp) / 1000,
+        0.05
+      );
+
+      previousTimestamp = timestamp;
+
+      const differenceX = targetX - currentX;
+      const differenceY = targetY - currentY;
+
+      const distance = Math.sqrt(
+        differenceX * differenceX +
+        differenceY * differenceY
+      );
+
+      const movementStep = movementSpeed * deltaTime;
+
+      // Reached destination.
+      if (distance <= movementStep || distance < 0.5) {
+        currentX = targetX;
+        currentY = targetY;
+
+        mousePositionRef.current = {
+          x: currentX,
+          y: currentY,
+        };
+
+        socket.emit("employeeMove", {
+          x: currentX,
+          y: currentY,
+        });
+
+        mouseMovementRef.current = null;
+        return;
+      }
+
+      // Move gradually towards the destination.
+      currentX += (differenceX / distance) * movementStep;
+      currentY += (differenceY / distance) * movementStep;
+
+      mousePositionRef.current = {
+        x: currentX,
+        y: currentY,
+      };
+
+      // Broadcast approximately 30 updates per second.
+      if (timestamp - lastEmitTimestamp >= 33) {
+        socket.emit("employeeMove", {
+          x: currentX,
+          y: currentY,
+        });
+
+        lastEmitTimestamp = timestamp;
+      }
+
+      mouseMovementRef.current =
+        requestAnimationFrame(animateMovement);
+    }
+
+    mouseMovementRef.current =
+      requestAnimationFrame(animateMovement);
+  }, [
+    isActive,
+    roomEmployees,
+    myEmployeeId,
+    stopMouseMovement,
+  ]);
+
+  // ==========================================
+  // CLEAN UP MOUSE MOVEMENT
+  // ==========================================
+
+  useEffect(() => {
+    stopMouseMovement();
+    mousePositionRef.current = null;
+
+    return () => {
+      stopMouseMovement();
+    };
+  }, [activeRoom, isActive, stopMouseMovement]);
+
+  // ==========================================
   // KEYBOARD MOVEMENT
   // ==========================================
 
@@ -702,11 +860,14 @@ function VirtualOffice({
 
       if (!currentEmployee || !socket.connected) return;
 
+      // Keyboard input takes control from mouse movement.
+      stopMouseMovement();
+
       event.preventDefault();
 
       const speed = 12;
 
-      let { x, y } = currentEmployee;
+      let { x, y } = mousePositionRef.current || currentEmployee;
 
       if (key === "w" || key === "arrowup") y -= speed;
       if (key === "s" || key === "arrowdown") y += speed;
@@ -715,6 +876,8 @@ function VirtualOffice({
 
       x = Math.max(20, Math.min(780, x));
       y = Math.max(20, Math.min(480, y));
+
+      mousePositionRef.current = { x, y };
 
       socket.emit("employeeMove", { x, y });
     }
@@ -728,6 +891,7 @@ function VirtualOffice({
     roomEmployees,
     myEmployeeId,
     isActive,
+    stopMouseMovement,
   ]);
 
   // ==========================================
@@ -744,7 +908,10 @@ function VirtualOffice({
         currentRoom={activeRoom}
       />
 
-      <section className="office-stage">
+      <section
+        className="office-stage"
+        onDoubleClick={handleOfficeDoubleClick}
+      >
         <img
           className="office-background"
           src={officeFloor}
@@ -776,45 +943,21 @@ function VirtualOffice({
                   top: `${6.5 + (employee.y / 500) * 86}%`,
                 }}
               >
-                <div className="avatar-voice-wrapper">
+                <div
+                  className="avatar-voice-wrapper"
+                  style={{
+                    "--voice-range-size": `${(voiceRange * 200) / 1536}cqi`,
+                  }}
+                >
                   {/* Proximity visuals are only needed in Workspace. */}
                   {!isGroupRoom && (
                     <>
-                      <div
-                        className="voice-range-circle"
-                        style={{
-                          "--voice-range-size": `${voiceRange * 2}px`,
-                        }}
-                        title={`Voice range: ${voiceRange}px`}
-                      />
 
-                      <div
-                        className="ocean-wave wave-one"
-                        style={{
-                          "--voice-range-size": `${voiceRange * 2}px`,
-                        }}
-                      />
+                      <div className="ocean-wave" />
+                      <div className="ocean-wave" />
+                      <div className="ocean-wave" />
 
-                      <div
-                        className="ocean-wave wave-two"
-                        style={{
-                          "--voice-range-size": `${voiceRange * 2}px`,
-                        }}
-                      />
-
-                      <div
-                        className="ocean-wave wave-three"
-                        style={{
-                          "--voice-range-size": `${voiceRange * 2}px`,
-                        }}
-                      />
-
-                      <div
-                        className="ocean-glow"
-                        style={{
-                          "--voice-range-size": `${voiceRange * 2}px`,
-                        }}
-                      />
+                      <div className="ocean-glow" />
                     </>
                   )}
 
