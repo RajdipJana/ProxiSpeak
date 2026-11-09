@@ -1,3 +1,4 @@
+
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -158,8 +159,9 @@ io.use(async (socket, next) => {
       return next(new Error("Invalid authentication token."));
     }
 
+    // Fetch team information directly from MongoDB.
     const employee = await Employee.findById(decoded.id).select(
-      "employeeId name role department isActive"
+      "employeeId name role department teamId teamName isActive"
     );
 
     if (!employee || !employee.isActive) {
@@ -174,6 +176,10 @@ io.use(async (socket, next) => {
       name: employee.name,
       role: employee.role,
       department: employee.department,
+
+      // Team information
+      teamId: employee.teamId || null,
+      teamName: employee.teamName || null,
     };
 
     next();
@@ -208,15 +214,6 @@ function distanceBetweenEmployees(employee1, employee2) {
 // ==========================================
 // VOICE RANGE PERMISSION
 // ==========================================
-
-// Main Workspace only.
-//
-// Both employees must be within the smaller of their
-// selected ranges before a WebRTC connection is allowed.
-//
-// 75px + 75px  = 75px
-// 75px + 120px = 75px
-// 120px + 120px = 120px
 
 function canEmployeesConnectByProximity(employee1, employee2) {
   if (
@@ -459,7 +456,7 @@ function resolveMovement(employee, targetX, targetY) {
 function broadcastEmployeeState() {
   const employeeList = Array.from(employees.values());
 
-  // Update the global employee directory.
+  // Includes teamId and teamName automatically.
   io.emit("employeesUpdate", employeeList);
 
   // Send room-aware voice information to each employee.
@@ -494,13 +491,6 @@ function broadcastEmployeeState() {
     let voicePeers;
 
     if (roomInfo.voiceMode === "proximity") {
-      // ======================================
-      // MAIN WORKSPACE — MUTUAL RANGE
-      // ======================================
-
-      // A pair is included only when BOTH employees
-      // are within the smaller of their two ranges.
-
       const mutuallyNearbyEmployees = sameRoomEmployees.filter(
         (employee) => {
           const mutualRange = Math.min(
@@ -515,24 +505,16 @@ function broadcastEmployeeState() {
       nearbyEmployees = mutuallyNearbyEmployees.map(
         (employee) => ({
           ...employee,
-
           youHearThem: true,
           theyHearYou: true,
         })
       );
 
-      // WebRTC connections are created only for
-      // mutually permitted voice pairs.
       voicePeers = nearbyEmployees;
     } else {
-      // ======================================
-      // GROUP ROOMS — UNRESTRICTED VOICE
-      // ======================================
-
       nearbyEmployees = sameRoomEmployees.map(
         (employee) => ({
           ...employee,
-
           youHearThem: true,
           theyHearYou: true,
         })
@@ -919,6 +901,10 @@ io.on("connection", (socket) => {
     role: authenticatedEmployee.role,
     department: authenticatedEmployee.department,
 
+    // Team information from MongoDB
+    teamId: authenticatedEmployee.teamId,
+    teamName: authenticatedEmployee.teamName,
+
     currentRoom: initialRoom,
 
     x: spawnPosition.x,
@@ -935,7 +921,7 @@ io.on("connection", (socket) => {
   saveEmployeePosition(employee);
 
   console.log(
-    `${name} (${userId}) connected in ${getRoomInfo(initialRoom).name} at X:${employee.x}, Y:${employee.y}`
+    `${name} (${userId}) connected | Team: ${employee.teamName || "Unassigned"} | ${getRoomInfo(initialRoom).name} | X:${employee.x}, Y:${employee.y}`
   );
 
   broadcastEmployeeState();
@@ -1092,7 +1078,6 @@ io.on("connection", (socket) => {
 
     saveEmployeePosition(currentEmployee);
 
-    // Recalculate mutual voice permissions after movement.
     broadcastEmployeeState();
   });
 
@@ -1177,8 +1162,6 @@ io.on("connection", (socket) => {
       `${currentEmployee.name} selected ${selectedRange}px Main Workspace voice range.`
     );
 
-    // Changing the range immediately recalculates
-    // all mutual voice permissions.
     broadcastEmployeeState();
   });
 
@@ -1237,7 +1220,6 @@ io.on("connection", (socket) => {
 
     if (!target) return;
 
-    // Never relay WebRTC signals between different rooms.
     if (sender.currentRoom !== target.currentRoom) {
       return;
     }
@@ -1258,13 +1240,9 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // voice-left is allowed even after the pair moves
-    // outside the permitted range, so the other client
-    // can clean up its existing WebRTC connection.
     if (signal.type !== "voice-left") {
       const roomInfo = getRoomInfo(sender.currentRoom);
 
-      // Main Workspace requires mutual range permission.
       if (
         roomInfo.voiceMode === "proximity" &&
         !canEmployeesConnectByProximity(sender, target)
@@ -1371,6 +1349,7 @@ async function startServer() {
 
       console.log("JWT authentication: enabled");
       console.log("Employee identity source: MongoDB");
+      console.log("Employee team information: enabled");
       console.log("Authentication API: /api/auth");
 
       console.log("Multi-room system: enabled");

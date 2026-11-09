@@ -1,3 +1,4 @@
+
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -38,7 +39,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // Compare entered password with stored bcrypt hash.
+    // Verify password
     const passwordMatch = await bcrypt.compare(
       password,
       employee.passwordHash
@@ -51,7 +52,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // Generate JWT authentication token.
+    // Generate JWT
     const token = jwt.sign(
       {
         id: employee._id.toString(),
@@ -67,12 +68,17 @@ router.post("/login", async (req, res) => {
       success: true,
       message: "Login successful.",
       token,
+
       user: {
         id: employee._id,
         employeeId: employee.employeeId,
         name: employee.name,
         role: employee.role,
         department: employee.department,
+
+        // Team information
+        teamId: employee.teamId || null,
+        teamName: employee.teamName || null,
       },
     });
   } catch (error) {
@@ -96,7 +102,6 @@ router.post(
     try {
       const { currentPassword, newPassword } = req.body;
 
-      // Validate password inputs.
       if (
         typeof currentPassword !== "string" ||
         typeof newPassword !== "string" ||
@@ -109,7 +114,6 @@ router.post(
         });
       }
 
-      // Enforce minimum password length.
       if (newPassword.length < 8) {
         return res.status(400).json({
           success: false,
@@ -117,7 +121,6 @@ router.post(
         });
       }
 
-      // Prevent reusing the current password.
       if (newPassword === currentPassword) {
         return res.status(400).json({
           success: false,
@@ -126,10 +129,8 @@ router.post(
         });
       }
 
-      // Retrieve authenticated employee.
       const employee = await Employee.findById(req.employee._id);
 
-      // Verify employee still exists and is active.
       if (!employee || !employee.isActive) {
         return res.status(401).json({
           success: false,
@@ -137,7 +138,6 @@ router.post(
         });
       }
 
-      // Verify current password.
       const passwordMatch = await bcrypt.compare(
         currentPassword,
         employee.passwordHash
@@ -150,7 +150,6 @@ router.post(
         });
       }
 
-      // Hash and save the new password.
       employee.passwordHash = await bcrypt.hash(newPassword, 12);
 
       await employee.save();

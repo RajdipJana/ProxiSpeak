@@ -1,3 +1,4 @@
+
 const mongoose = require("mongoose");
 
 const employeeSchema = new mongoose.Schema(
@@ -18,7 +19,7 @@ const employeeSchema = new mongoose.Schema(
       trim: true,
     },
 
-    // Hashed password (never store plain passwords)
+    // Hashed password
     passwordHash: {
       type: String,
       required: true,
@@ -35,6 +36,20 @@ const employeeSchema = new mongoose.Schema(
     department: {
       type: String,
       default: "General",
+    },
+
+    // Company-assigned team information
+    teamId: {
+      type: String,
+      default: null,
+      trim: true,
+      uppercase: true,
+    },
+
+    teamName: {
+      type: String,
+      default: null,
+      trim: true,
     },
 
     // Account status
