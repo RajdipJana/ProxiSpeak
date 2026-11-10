@@ -4,7 +4,7 @@ import Header from "../components/Header";
 import socket from "../socket";
 import "./MeetingRoom.css";
 
-const API_URL = "http://localhost:5000";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 const ICE_SERVERS = {
   iceServers: [

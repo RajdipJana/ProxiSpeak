@@ -2,7 +2,7 @@ import { useState } from "react";
 import Header from "../components/Header";
 import "./Profile.css";
 
-const API_URL = "http://localhost:5000";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 function Profile({ user, onNavigate, onLogout }) {
   const [currentPassword, setCurrentPassword] = useState("");
