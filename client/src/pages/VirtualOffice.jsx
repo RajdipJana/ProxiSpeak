@@ -14,15 +14,11 @@ import "./VirtualOffice.css";
 
 import workspaceFloor from "../assets/MainOffice.png";
 import conferenceFloor from "../assets/ConferenceRoom.png";
-import meetingRoom1Floor from "../assets/MeetingRoom1.png";
-import meetingRoom2Floor from "../assets/MeetingRoom2.png";
 
 // Room backgrounds
 const ROOM_BACKGROUNDS = {
   workspace: workspaceFloor,
   conference: conferenceFloor,
-  meeting1: meetingRoom1Floor,
-  meeting2: meetingRoom2Floor,
 };
 
 // Public STUN server helps peers discover direct connection paths.
@@ -96,6 +92,10 @@ function VirtualOffice({
   const voiceEnabledRef = useRef(false);
   const announcedPeersRef = useRef(new Set());
 
+  // Prevent pending microphone requests from activating
+  // room voice after the user has left voice or entered a meeting.
+  const voiceRequestIdRef = useRef(0);
+
   // Remote audio refs
   const audioElementsRef = useRef(new Map());
   const audioRefCallbacksRef = useRef(new Map());
@@ -131,7 +131,7 @@ function VirtualOffice({
 
   const getPeerTargetVolume = useCallback(
     (peerId) => {
-      // Meeting and conference rooms always use full volume.
+      // Conference Room always uses full volume.
       if (activeRoom !== "workspace") {
         return 1;
       }
@@ -566,6 +566,9 @@ function VirtualOffice({
     function handleDisconnect() {
       setMyEmployeeId("");
 
+      // Invalidate any microphone request still pending.
+      voiceRequestIdRef.current += 1;
+
       voiceEnabledRef.current = false;
 
       setVoiceJoined(false);
@@ -601,6 +604,7 @@ function VirtualOffice({
 
       // This cleanup happens when the persistent
       // VirtualOffice component actually unmounts.
+      voiceRequestIdRef.current += 1;
       voiceEnabledRef.current = false;
 
       localStreamRef.current?.getTracks().forEach((track) => {
@@ -722,6 +726,9 @@ function VirtualOffice({
 
     setVoiceError("");
 
+    // Every microphone request gets a unique ID.
+    const requestId = ++voiceRequestIdRef.current;
+
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error(
@@ -739,7 +746,12 @@ function VirtualOffice({
           video: false,
         });
 
-      if (!socket.connected) {
+      // If leaveVoice() was called while microphone
+      // permission was pending, stop this stream immediately.
+      if (
+        requestId !== voiceRequestIdRef.current ||
+        !socket.connected
+      ) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
@@ -772,6 +784,12 @@ function VirtualOffice({
         });
       });
     } catch (error) {
+      // Ignore errors from microphone requests that
+      // were cancelled while waiting for permission.
+      if (requestId !== voiceRequestIdRef.current) {
+        return;
+      }
+
       console.error(
         "Microphone access failed:",
         error
@@ -790,8 +808,13 @@ function VirtualOffice({
   // ==========================================
 
   const leaveVoice = useCallback(() => {
+    // Invalidate any microphone request still waiting
+    // for browser permission.
+    voiceRequestIdRef.current += 1;
+
     voiceEnabledRef.current = false;
 
+    // Tell all connected colleagues that voice has stopped.
     for (const peerId of peerConnectionsRef.current.keys()) {
       if (socket.connected) {
         socket.emit("voiceSignal", {
@@ -803,7 +826,11 @@ function VirtualOffice({
       }
     }
 
+    // Close every room voice connection.
     for (const pc of peerConnectionsRef.current.values()) {
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.onconnectionstatechange = null;
       pc.close();
     }
 
@@ -812,6 +839,7 @@ function VirtualOffice({
     announcedPeersRef.current.clear();
     offerInProgressRef.current.clear();
 
+    // Stop the local microphone completely.
     localStreamRef.current?.getTracks().forEach((track) => {
       track.stop();
     });

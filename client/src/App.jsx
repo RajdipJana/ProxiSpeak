@@ -7,6 +7,7 @@ import Profile from "./pages/Profile";
 import People from "./pages/People";
 import MyTeam from "./pages/MyTeam";
 import Meetings from "./pages/Meetings";
+import MeetingRoom from "./pages/MeetingRoom";
 import Chat from "./pages/Chat";
 import Settings from "./pages/Settings";
 
@@ -16,8 +17,6 @@ import AppStatusContext from "./AppStatusContext";
 const ROOM_NAMES = {
   workspace: "Workspace",
   conference: "Conference Room",
-  meeting1: "Meeting Room 01",
-  meeting2: "Meeting Room 02",
 };
 
 const DEFAULT_VOICE_RANGE = 120;
@@ -51,10 +50,29 @@ function getSavedVoiceRange() {
 function App() {
   const [user, setUser] = useState(null);
   const [currentPage, setCurrentPage] = useState("VirtualOffice");
-
   const [currentRoom, setCurrentRoom] = useState("workspace");
 
-  // Room transition confirmation.
+  // Active logical team meeting.
+  const [activeMeeting, setActiveMeeting] = useState(null);
+
+  // Meeting return information.
+  const meetingSessionRef = useRef(null);
+
+  // Meeting exit confirmation and handover.
+  const [showMeetingExitDialog, setShowMeetingExitDialog] =
+    useState(false);
+
+  const [pendingMeetingNavigation, setPendingMeetingNavigation] =
+    useState(null);
+
+  const [meetingExitRequest, setMeetingExitRequest] = useState(null);
+  const meetingExitRequestIdRef = useRef(0);
+
+  // Restore workspace/conference voice after a meeting.
+  const [voiceRestoreRequest, setVoiceRestoreRequest] = useState(null);
+  const voiceRestoreStartedRef = useRef(false);
+
+  // Physical room transition confirmation.
   const [pendingRoom, setPendingRoom] = useState(null);
   const [switchingRoom, setSwitchingRoom] = useState(false);
   const [roomSwitchError, setRoomSwitchError] = useState("");
@@ -64,23 +82,19 @@ function App() {
   const currentRoomRef = useRef(currentRoom);
   const pendingHistoryPageRef = useRef(null);
 
-  // Global live application status.
+  // Global application status.
   const [connected, setConnected] = useState(false);
   const [employees, setEmployees] = useState([]);
   const [nearbyEmployees, setNearbyEmployees] = useState([]);
-
-  // All employees requiring a WebRTC connection.
   const [voicePeers, setVoicePeers] = useState([]);
 
   const [voiceRange, setVoiceRange] = useState(DEFAULT_VOICE_RANGE);
 
-  // User's saved Main Workspace voice preference.
   const [voiceRangePreference, setVoiceRangePreference] =
     useState(getSavedVoiceRange);
 
   const voiceRangePreferenceRef = useRef(voiceRangePreference);
 
-  // Global voice controls managed by persistent VirtualOffice.
   const [voiceControls, setVoiceControls] = useState(
     INITIAL_VOICE_CONTROLS
   );
@@ -89,12 +103,10 @@ function App() {
     setVoiceControls(controls);
   }, []);
 
-  // Keep the preference ref synchronized.
   useEffect(() => {
     voiceRangePreferenceRef.current = voiceRangePreference;
   }, [voiceRangePreference]);
 
-  // Update the saved Workspace voice preference.
   const handleVoiceRangeChange = useCallback((newRange) => {
     const selectedRange = Number(newRange);
 
@@ -120,16 +132,239 @@ function App() {
     }
   }, []);
 
-  // Global temporary chat messages.
   const [messages, setMessages] = useState([]);
 
-  // Keep refs synchronized with the latest application state.
   useEffect(() => {
     currentPageRef.current = currentPage;
     currentRoomRef.current = currentRoom;
   }, [currentPage, currentRoom]);
 
-  // Initialize browser history only once.
+  // ==========================================
+  // START A MEETING AND SUSPEND CURRENT ROOM VOICE
+  // ==========================================
+
+  const prepareMeetingEntry = useCallback((selectedMeeting) => {
+    if (!selectedMeeting?._id && !selectedMeeting?.id) {
+      console.error("Cannot open MeetingRoom: meeting data is missing.");
+      return false;
+    }
+
+    // Prevent replacing an existing meeting session.
+    if (currentPageRef.current === "MeetingRoom") {
+      return false;
+    }
+
+    // Remember the exact room and voice state.
+    meetingSessionRef.current = {
+      previousRoom: currentRoomRef.current,
+      voiceWasJoined: Boolean(voiceControls.voiceJoined),
+      wasMuted: Boolean(voiceControls.muted),
+    };
+
+    // Completely stop the previous room voice before mounting MeetingRoom.
+    if (voiceControls.voiceJoined) {
+      voiceControls.onLeaveVoice?.();
+    }
+
+    setVoiceRestoreRequest(null);
+    voiceRestoreStartedRef.current = false;
+
+    setActiveMeeting(selectedMeeting);
+
+    return true;
+  }, [voiceControls]);
+
+  // ==========================================
+  // REQUEST MEETING EXIT
+  // ==========================================
+
+  const requestMeetingExit = useCallback((targetPage, targetRoom = null) => {
+    if (currentPageRef.current !== "MeetingRoom") return;
+
+    setPendingMeetingNavigation({
+      targetPage: targetPage || "VirtualOffice",
+      targetRoom:
+        targetRoom && ROOM_NAMES[targetRoom]
+          ? targetRoom
+          : null,
+    });
+
+    setShowMeetingExitDialog(true);
+  }, []);
+
+  const cancelMeetingExit = useCallback(() => {
+    setShowMeetingExitDialog(false);
+    setPendingMeetingNavigation(null);
+  }, []);
+
+  const confirmMeetingExit = useCallback(
+    (destination = "previous") => {
+      if (currentPageRef.current !== "MeetingRoom") return;
+
+      const session = meetingSessionRef.current;
+
+      let targetPage = "VirtualOffice";
+      let targetRoom = session?.previousRoom || currentRoomRef.current;
+
+      if (destination === "workspace") {
+        targetRoom = "workspace";
+      } else if (destination === "conference") {
+        targetRoom = "conference";
+      } else if (destination === "requested") {
+        targetPage =
+          pendingMeetingNavigation?.targetPage || "VirtualOffice";
+
+        targetRoom =
+          pendingMeetingNavigation?.targetRoom || targetRoom;
+      }
+
+      meetingExitRequestIdRef.current += 1;
+
+      setMeetingExitRequest({
+        id: meetingExitRequestIdRef.current,
+        targetPage,
+        targetRoom,
+      });
+
+      setShowMeetingExitDialog(false);
+      setPendingMeetingNavigation(null);
+    },
+    [pendingMeetingNavigation]
+  );
+
+  // ==========================================
+  // COMPLETE MEETING EXIT
+  // Called by MeetingRoom after its media is stopped
+  // and its backend leave/end request succeeds.
+  // ==========================================
+
+  const handleMeetingExitComplete = useCallback(
+    async (exitData = {}) => {
+      const session = meetingSessionRef.current;
+
+      const targetPage =
+        exitData.targetPage || "VirtualOffice";
+
+      const targetRoom =
+        ROOM_NAMES[exitData.targetRoom]
+          ? exitData.targetRoom
+          : session?.previousRoom || currentRoomRef.current;
+
+      setMeetingExitRequest(null);
+      setShowMeetingExitDialog(false);
+      setPendingMeetingNavigation(null);
+
+      // The meeting backend should already have restored presence.
+      // Now switch physical rooms if the user selected another room.
+      if (targetRoom !== currentRoomRef.current) {
+        if (!socket.connected) {
+          setRoomSwitchError(
+            "You were disconnected while leaving the meeting. Please reconnect."
+          );
+          return;
+        }
+
+        setSwitchingRoom(true);
+
+        const switchResult = await new Promise((resolve) => {
+          socket.emit(
+            "switchRoom",
+            { roomId: targetRoom },
+            (response = {}) => resolve(response)
+          );
+        });
+
+        if (switchResult?.success === false) {
+          setSwitchingRoom(false);
+          setRoomSwitchError(
+            switchResult.message ||
+              "Could not enter the selected room."
+          );
+          return;
+        }
+
+        currentRoomRef.current = targetRoom;
+        setCurrentRoom(targetRoom);
+        setSwitchingRoom(false);
+        setRoomSwitchError("");
+      }
+
+      setActiveMeeting(null);
+
+      currentPageRef.current = targetPage;
+      setCurrentPage(targetPage);
+
+      window.history.replaceState(
+        {
+          page: targetPage,
+          roomId: targetRoom,
+        },
+        "",
+        window.location.pathname
+      );
+
+      pendingHistoryPageRef.current = null;
+
+      // Restore voice only if it was active before the meeting.
+      if (session?.voiceWasJoined) {
+        setVoiceRestoreRequest({
+          muted: Boolean(session.wasMuted),
+          room: targetRoom,
+        });
+      } else {
+        setVoiceRestoreRequest(null);
+      }
+
+      voiceRestoreStartedRef.current = false;
+      meetingSessionRef.current = null;
+      setPendingRoom(null);
+    },
+    []
+  );
+
+  // ==========================================
+  // RESTORE PREVIOUS ROOM VOICE
+  // ==========================================
+
+  useEffect(() => {
+    if (!voiceRestoreRequest) return;
+    if (currentPage === "MeetingRoom") return;
+    if (!connected) return;
+
+    // First reconnect to the previous room's voice session.
+    if (!voiceControls.voiceJoined) {
+      if (voiceRestoreStartedRef.current) return;
+
+      voiceRestoreStartedRef.current = true;
+
+      Promise.resolve(
+        voiceControls.onJoinVoice?.()
+      ).catch((error) => {
+        console.error("Could not restore room voice:", error);
+        voiceRestoreStartedRef.current = false;
+      });
+
+      return;
+    }
+
+    // Once connected, restore the previous mute state.
+    if (voiceRestoreRequest.muted && !voiceControls.muted) {
+      voiceControls.onToggleMute?.();
+    }
+
+    setVoiceRestoreRequest(null);
+    voiceRestoreStartedRef.current = false;
+  }, [
+    voiceRestoreRequest,
+    currentPage,
+    connected,
+    voiceControls,
+  ]);
+
+  // ==========================================
+  // BROWSER HISTORY
+  // ==========================================
+
   useEffect(() => {
     window.history.replaceState(
       {
@@ -142,7 +377,29 @@ function App() {
 
     function handlePopState(event) {
       const targetPage = event.state?.page || "VirtualOffice";
-      const targetRoom = event.state?.roomId || "workspace";
+      const requestedRoom = event.state?.roomId || "workspace";
+
+      const targetRoom = ROOM_NAMES[requestedRoom]
+        ? requestedRoom
+        : "workspace";
+
+      // Browser Back while inside a meeting requires confirmation.
+      if (
+        currentPageRef.current === "MeetingRoom" &&
+        targetPage !== "MeetingRoom"
+      ) {
+        window.history.pushState(
+          {
+            page: "MeetingRoom",
+            roomId: currentRoomRef.current,
+          },
+          "",
+          window.location.pathname
+        );
+
+        requestMeetingExit(targetPage, targetRoom);
+        return;
+      }
 
       if (targetRoom !== currentRoomRef.current) {
         window.history.pushState(
@@ -163,6 +420,12 @@ function App() {
       }
 
       pendingHistoryPageRef.current = null;
+
+      if (targetPage !== "MeetingRoom") {
+        setActiveMeeting(null);
+      }
+
+      currentPageRef.current = targetPage;
       setCurrentPage(targetPage);
     }
 
@@ -171,9 +434,12 @@ function App() {
     return () => {
       window.removeEventListener("popstate", handlePopState);
     };
-  }, []);
+  }, [requestMeetingExit]);
 
-  // One authenticated Socket.IO connection for the logged-in session.
+  // ==========================================
+  // AUTHENTICATED SOCKET CONNECTION
+  // ==========================================
+
   useEffect(() => {
     if (!user || !user.token) {
       socket.disconnect();
@@ -219,15 +485,17 @@ function App() {
       );
 
       if (myEmployee?.currentRoom) {
-        currentRoomRef.current = myEmployee.currentRoom;
-        setCurrentRoom(myEmployee.currentRoom);
+        const confirmedRoom = ROOM_NAMES[myEmployee.currentRoom]
+          ? myEmployee.currentRoom
+          : "workspace";
+
+        currentRoomRef.current = confirmedRoom;
+        setCurrentRoom(confirmedRoom);
       }
     }
 
     function handleProximityUpdate(data = {}) {
       setNearbyEmployees(data.nearbyEmployees || []);
-
-      // All peers that require WebRTC connections.
       setVoicePeers(data.voicePeers || []);
 
       if (data.voiceMode === "proximity") {
@@ -308,9 +576,20 @@ function App() {
     };
   }, [user]);
 
-  // Handle successful login.
+  // ==========================================
+  // LOGIN
+  // ==========================================
+
   function handleLogin(userData) {
     setMessages([]);
+    setActiveMeeting(null);
+    meetingSessionRef.current = null;
+
+    setMeetingExitRequest(null);
+    setVoiceRestoreRequest(null);
+    setShowMeetingExitDialog(false);
+    setPendingMeetingNavigation(null);
+
     setCurrentRoom("workspace");
     setCurrentPage("VirtualOffice");
 
@@ -335,12 +614,23 @@ function App() {
     );
   }
 
-  // Handle logout.
+  // ==========================================
+  // LOGOUT
+  // ==========================================
+
   function handleLogout() {
     socket.disconnect();
 
     setMessages([]);
     setUser(null);
+    setActiveMeeting(null);
+    meetingSessionRef.current = null;
+
+    setMeetingExitRequest(null);
+    setVoiceRestoreRequest(null);
+    setShowMeetingExitDialog(false);
+    setPendingMeetingNavigation(null);
+
     setCurrentPage("VirtualOffice");
     setCurrentRoom("workspace");
 
@@ -364,14 +654,49 @@ function App() {
     window.history.replaceState(null, "", "/");
   }
 
-  // Normal application navigation.
-  function handleNavigate(page) {
-    if (page === currentPageRef.current) return;
+  // ==========================================
+  // NAVIGATION
+  // ==========================================
+
+  function handleNavigate(page, data = null) {
+    // Any attempt to navigate away from a meeting
+    // must first pass through the exit confirmation.
+    if (
+      currentPageRef.current === "MeetingRoom" &&
+      page !== "MeetingRoom"
+    ) {
+      requestMeetingExit(
+        page,
+        data?.roomId || data?.targetRoom || null
+      );
+      return;
+    }
+
+    if (page === "MeetingRoom") {
+      const selectedMeeting = data?.meeting || data;
+
+      const prepared = prepareMeetingEntry(selectedMeeting);
+
+      if (!prepared) return;
+
+      setActiveMeeting(selectedMeeting);
+    } else if (page === "Meetings") {
+      setActiveMeeting(null);
+    }
+
+    if (page === currentPageRef.current) {
+      return;
+    }
 
     window.history.pushState(
       {
         page,
         roomId: currentRoomRef.current,
+        meetingId:
+          page === "MeetingRoom"
+            ? (data?.meeting || data)?._id ||
+              (data?.meeting || data)?.id
+            : undefined,
       },
       "",
       window.location.pathname
@@ -381,18 +706,24 @@ function App() {
     setCurrentPage(page);
   }
 
-  // Request a room transition.
+  // ==========================================
+  // PHYSICAL ROOM TRANSITION
+  // ==========================================
+
   function handleRequestRoomChange(roomId) {
     if (!ROOM_NAMES[roomId]) {
       console.error("Invalid room:", roomId);
       return;
     }
 
-    if (roomId === currentRoomRef.current) {
+    // If a room change is requested from MeetingRoom,
+    // it must use the meeting exit confirmation instead.
+    if (currentPageRef.current === "MeetingRoom") {
+      requestMeetingExit("VirtualOffice", roomId);
       return;
     }
 
-    if (switchingRoom) {
+    if (roomId === currentRoomRef.current || switchingRoom) {
       return;
     }
 
@@ -402,7 +733,6 @@ function App() {
     setPendingRoom(roomId);
   }
 
-  // Cancel a room transition.
   function handleCancelRoomChange() {
     if (switchingRoom) return;
 
@@ -412,7 +742,6 @@ function App() {
     setRoomSwitchError("");
   }
 
-  // Confirm and request the room transition from the server.
   function handleConfirmRoomChange() {
     if (!pendingRoom || switchingRoom) return;
 
@@ -454,12 +783,15 @@ function App() {
         currentRoomRef.current = finalRoom;
         setCurrentRoom(finalRoom);
 
-        currentPageRef.current = "VirtualOffice";
-        setCurrentPage("VirtualOffice");
+        currentPageRef.current =
+          pendingHistoryPageRef.current || "VirtualOffice";
+
+        setCurrentPage(currentPageRef.current);
+        setActiveMeeting(null);
 
         window.history.replaceState(
           {
-            page: "VirtualOffice",
+            page: currentPageRef.current,
             roomId: finalRoom,
           },
           "",
@@ -471,13 +803,13 @@ function App() {
         setPendingRoom(null);
         setSwitchingRoom(false);
         setRoomSwitchError("");
-
-        console.log(
-          `Entered ${ROOM_NAMES[finalRoom]} successfully.`
-        );
       }
     );
   }
+
+  // ==========================================
+  // LOGIN PAGE
+  // ==========================================
 
   if (!user) {
     return <Login onLogin={handleLogin} />;
@@ -498,6 +830,10 @@ function App() {
     messages,
   };
 
+  // ==========================================
+  // PAGE ROUTING
+  // ==========================================
+
   let currentPageComponent = null;
 
   switch (currentPage) {
@@ -515,6 +851,17 @@ function App() {
 
     case "Meetings":
       currentPageComponent = <Meetings {...pageProps} />;
+      break;
+
+    case "MeetingRoom":
+      currentPageComponent = (
+        <MeetingRoom
+          {...pageProps}
+          meeting={activeMeeting}
+          meetingExitRequest={meetingExitRequest}
+          onMeetingExitComplete={handleMeetingExitComplete}
+        />
+      );
       break;
 
     case "Chat":
@@ -542,6 +889,13 @@ function App() {
   const destinationRoomName = pendingRoom
     ? ROOM_NAMES[pendingRoom]
     : "";
+
+  const previousMeetingRoom =
+    meetingSessionRef.current?.previousRoom || currentRoom;
+
+  // ==========================================
+  // UI
+  // ==========================================
 
   return (
     <AppStatusContext.Provider
@@ -576,7 +930,183 @@ function App() {
       {/* Other application pages. */}
       {currentPageComponent}
 
-      {/* Room transition confirmation dialog. */}
+      {/* ======================================
+          MEETING EXIT CONFIRMATION
+          ====================================== */}
+      {showMeetingExitDialog && currentPage === "MeetingRoom" && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 20000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "20px",
+            background: "rgba(0, 0, 0, 0.78)",
+            backdropFilter: "blur(7px)",
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="meeting-exit-title"
+            style={{
+              width: "100%",
+              maxWidth: "460px",
+              padding: "28px",
+              borderRadius: "18px",
+              background: "#171c25",
+              border: "1px solid #343d4c",
+              color: "#ffffff",
+              boxShadow: "0 20px 70px rgba(0,0,0,0.5)",
+            }}
+          >
+            <div
+              style={{
+                width: "48px",
+                height: "48px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: "14px",
+                background: "rgba(255, 170, 60, 0.12)",
+                color: "#ffbd65",
+                fontSize: "24px",
+                marginBottom: "18px",
+              }}
+            >
+              !
+            </div>
+
+            <h2
+              id="meeting-exit-title"
+              style={{
+                margin: "0 0 12px",
+                fontSize: "21px",
+                fontWeight: 700,
+              }}
+            >
+              Leave this meeting?
+            </h2>
+
+            <p
+              style={{
+                margin: "0",
+                color: "#b5bdca",
+                fontSize: "14px",
+                lineHeight: 1.7,
+              }}
+            >
+              Your meeting microphone and screen sharing will stop.
+              {activeMeeting?.hostEmployeeId === user?.employeeId
+                ? " As the host, leaving will end the meeting for everyone."
+                : " You will leave this meeting and return to your selected room."}
+            </p>
+
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+                marginTop: "24px",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => confirmMeetingExit("previous")}
+                style={{
+                  width: "100%",
+                  padding: "12px",
+                  border: "none",
+                  borderRadius: "9px",
+                  background: "#bee835",
+                  color: "#17200a",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                Return to {ROOM_NAMES[previousMeetingRoom]}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => confirmMeetingExit("workspace")}
+                style={{
+                  width: "100%",
+                  padding: "12px",
+                  border: "1px solid #414b5c",
+                  borderRadius: "9px",
+                  background: "transparent",
+                  color: "#ffffff",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Leave and enter Workspace
+              </button>
+
+              <button
+                type="button"
+                onClick={() => confirmMeetingExit("conference")}
+                style={{
+                  width: "100%",
+                  padding: "12px",
+                  border: "1px solid #414b5c",
+                  borderRadius: "9px",
+                  background: "transparent",
+                  color: "#ffffff",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Leave and enter Conference Room
+              </button>
+
+              {pendingMeetingNavigation &&
+                pendingMeetingNavigation.targetPage !== "VirtualOffice" && (
+                  <button
+                    type="button"
+                    onClick={() => confirmMeetingExit("requested")}
+                    style={{
+                      width: "100%",
+                      padding: "12px",
+                      border: "1px solid #414b5c",
+                      borderRadius: "9px",
+                      background: "transparent",
+                      color: "#ffffff",
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Continue to {pendingMeetingNavigation.targetPage}
+                  </button>
+                )}
+
+              <button
+                type="button"
+                onClick={cancelMeetingExit}
+                style={{
+                  width: "100%",
+                  padding: "11px",
+                  border: "none",
+                  borderRadius: "9px",
+                  background: "transparent",
+                  color: "#aab4c2",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Stay in Meeting
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================
+          PHYSICAL ROOM TRANSITION DIALOG
+          ====================================== */}
       {pendingRoom && (
         <div
           style={{

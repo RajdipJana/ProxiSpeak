@@ -10,7 +10,10 @@ const { performance } = require("node:perf_hooks");
 
 const UserLocation = require("./models/UserLocation");
 const Employee = require("./models/Employee");
+const Meeting = require("./models/Meeting");
+
 const authRoutes = require("./routes/authRoutes");
+const meetingRoutes = require("./routes/meetingRoutes");
 
 dotenv.config();
 mongoose.set("autoIndex", false);
@@ -21,11 +24,8 @@ const server = http.createServer(app);
 app.use(cors());
 app.use(express.json());
 
-// ==========================================
-// AUTHENTICATION ROUTES
-// ==========================================
-
 app.use("/api/auth", authRoutes);
+app.use("/api/meetings", meetingRoutes);
 
 // ==========================================
 // SOCKET.IO CONFIGURATION
@@ -37,6 +37,8 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
   },
 });
+
+app.set("io", io);
 
 // ==========================================
 // VIRTUAL OFFICE SETTINGS
@@ -56,6 +58,19 @@ const CLUSTER_DISTANCE_PIXELS = 100;
 const COLLISION_DISTANCE = 20;
 const MAX_CHAT_MESSAGE_LENGTH = 1000;
 
+const MAX_MEETING_SIGNAL_SIZE = 1024 * 1024;
+
+const ALLOWED_MEETING_SIGNAL_TYPES = [
+  "offer",
+  "answer",
+  "candidate",
+  "voice-ready",
+  "voice-ready-ack",
+  "voice-left",
+  "screen-share-start",
+  "screen-share-stop",
+];
+
 // ==========================================
 // ROOM CONFIGURATION
 // ==========================================
@@ -70,18 +85,6 @@ const ROOMS = {
   conference: {
     id: "conference",
     name: "Conference Room",
-    voiceMode: "group",
-  },
-
-  meeting1: {
-    id: "meeting1",
-    name: "Meeting Room 01",
-    voiceMode: "group",
-  },
-
-  meeting2: {
-    id: "meeting2",
-    name: "Meeting Room 02",
     voiceMode: "group",
   },
 };
@@ -103,10 +106,7 @@ function getRoomInfo(roomId) {
 // CONNECTED EMPLOYEES
 // ==========================================
 
-// Key: Socket ID
 const employees = new Map();
-
-// Employee positions are stored separately for each room.
 const employeePositions = new Map();
 
 // ==========================================
@@ -123,7 +123,6 @@ function getEmployeeRoomPositions(userId) {
 
 function getSavedPosition(userId, roomId) {
   const positions = getEmployeeRoomPositions(userId);
-
   return positions[roomId] || null;
 }
 
@@ -159,7 +158,6 @@ io.use(async (socket, next) => {
       return next(new Error("Invalid authentication token."));
     }
 
-    // Fetch team information directly from MongoDB.
     const employee = await Employee.findById(decoded.id).select(
       "employeeId name role department teamId teamName isActive"
     );
@@ -176,8 +174,6 @@ io.use(async (socket, next) => {
       name: employee.name,
       role: employee.role,
       department: employee.department,
-
-      // Team information
       teamId: employee.teamId || null,
       teamName: employee.teamName || null,
     };
@@ -226,7 +222,6 @@ function canEmployeesConnectByProximity(employee1, employee2) {
 
   const roomInfo = getRoomInfo(employee1.currentRoom);
 
-  // Group rooms do not use proximity restrictions.
   if (roomInfo.voiceMode === "group") {
     return true;
   }
@@ -236,17 +231,13 @@ function canEmployeesConnectByProximity(employee1, employee2) {
     employee2.voiceRange
   );
 
-  const distance = distanceBetweenEmployees(
-    employee1,
-    employee2
+  return (
+    distanceBetweenEmployees(employee1, employee2) <= mutualRange
   );
-
-  return distance <= mutualRange;
 }
 
 // ==========================================
 // COLLISION DETECTION
-// ROOM-SPECIFIC
 // ==========================================
 
 function isPositionAvailable(
@@ -256,13 +247,9 @@ function isPositionAvailable(
   excludeSocketId = null
 ) {
   for (const employee of employees.values()) {
-    if (employee.socketId === excludeSocketId) {
-      continue;
-    }
-
-    if (employee.currentRoom !== roomId) {
-      continue;
-    }
+    if (employee.socketId === excludeSocketId) continue;
+    if (employee.activeMeetingId) continue;
+    if (employee.currentRoom !== roomId) continue;
 
     const distance = distanceInPixels(
       x,
@@ -281,14 +268,9 @@ function isPositionAvailable(
 
 // ==========================================
 // FIND A FREE SPAWN POSITION
-// ROOM-SPECIFIC
 // ==========================================
 
-function findFreePosition(
-  preferredX,
-  preferredY,
-  roomId
-) {
+function findFreePosition(preferredX, preferredY, roomId) {
   const x = Math.max(
     30,
     Math.min(OFFICE_WIDTH - 30, preferredX)
@@ -325,13 +307,7 @@ function findFreePosition(
         )
       );
 
-      if (
-        isPositionAvailable(
-          candidateX,
-          candidateY,
-          roomId
-        )
-      ) {
+      if (isPositionAvailable(candidateX, candidateY, roomId)) {
         return {
           x: candidateX,
           y: candidateY,
@@ -340,7 +316,6 @@ function findFreePosition(
     }
   }
 
-  // Final fallback: scan the room in a grid.
   for (
     let gridY = 30;
     gridY <= OFFICE_HEIGHT - 30;
@@ -365,13 +340,11 @@ function findFreePosition(
 
 // ==========================================
 // RESOLVE EMPLOYEE MOVEMENT
-// ROOM-SPECIFIC
 // ==========================================
 
 function resolveMovement(employee, targetX, targetY) {
   const currentX = employee.x;
   const currentY = employee.y;
-
   const roomId = employee.currentRoom;
 
   const nextX = Math.max(
@@ -392,10 +365,7 @@ function resolveMovement(employee, targetX, targetY) {
       employee.socketId
     )
   ) {
-    return {
-      x: nextX,
-      y: nextY,
-    };
+    return { x: nextX, y: nextY };
   }
 
   const horizontalAvailable = isPositionAvailable(
@@ -417,36 +387,21 @@ function resolveMovement(employee, targetX, targetY) {
       Math.abs(nextX - currentX) >=
       Math.abs(nextY - currentY)
     ) {
-      return {
-        x: nextX,
-        y: currentY,
-      };
+      return { x: nextX, y: currentY };
     }
 
-    return {
-      x: currentX,
-      y: nextY,
-    };
+    return { x: currentX, y: nextY };
   }
 
   if (horizontalAvailable) {
-    return {
-      x: nextX,
-      y: currentY,
-    };
+    return { x: nextX, y: currentY };
   }
 
   if (verticalAvailable) {
-    return {
-      x: currentX,
-      y: nextY,
-    };
+    return { x: currentX, y: nextY };
   }
 
-  return {
-    x: currentX,
-    y: currentY,
-  };
+  return { x: currentX, y: currentY };
 }
 
 // ==========================================
@@ -454,20 +409,33 @@ function resolveMovement(employee, targetX, targetY) {
 // ==========================================
 
 function broadcastEmployeeState() {
-  const employeeList = Array.from(employees.values());
+  // Never broadcast meeting participants as office avatars.
+  const employeeList = Array.from(employees.values()).filter(
+    (employee) => !employee.activeMeetingId
+  );
 
-  // Includes teamId and teamName automatically.
   io.emit("employeesUpdate", employeeList);
 
-  // Send room-aware voice information to each employee.
   for (const socket of io.sockets.sockets.values()) {
     const currentEmployee = employees.get(socket.id);
 
     if (!currentEmployee) continue;
 
-    const roomInfo = getRoomInfo(
-      currentEmployee.currentRoom
-    );
+    // Employees in meetings receive no workspace voice peers.
+    if (currentEmployee.activeMeetingId) {
+      socket.emit("proximityUpdate", {
+        nearbyEmployees: [],
+        voicePeers: [],
+        voiceRange: null,
+        voiceRangePreference: currentEmployee.voiceRange,
+        currentRoom: currentEmployee.currentRoom,
+        voiceMode: "disabled",
+      });
+
+      continue;
+    }
+
+    const roomInfo = getRoomInfo(currentEmployee.currentRoom);
 
     const sameRoomEmployees = employeeList
       .filter((employee) => {
@@ -478,7 +446,6 @@ function broadcastEmployeeState() {
       })
       .map((employee) => ({
         ...employee,
-
         distance: Number(
           distanceBetweenEmployees(
             currentEmployee,
@@ -533,13 +500,87 @@ function broadcastEmployeeState() {
           : null,
 
       voiceRangePreference: currentEmployee.voiceRange,
-
       currentRoom: currentEmployee.currentRoom,
-
       voiceMode: roomInfo.voiceMode,
     });
   }
 }
+
+// ==========================================
+// MEETING PRESENCE RESTORATION
+// ==========================================
+
+// Restore all connected sockets belonging to an employee
+// when that employee leaves a meeting.
+
+async function restoreMeetingPresence(employeeId, meetingId) {
+  const affectedSockets = [];
+
+  for (const [socketId, employee] of employees.entries()) {
+    if (
+      employee.userId === employeeId &&
+      employee.activeMeetingId === meetingId
+    ) {
+      const socket = io.sockets.sockets.get(socketId);
+
+      if (socket) {
+        affectedSockets.push(socket);
+      }
+
+      employee.activeMeetingId = null;
+      employee.isVoiceActive = false;
+      employee.isMuted = false;
+
+      employees.set(socketId, employee);
+    }
+  }
+
+  await Promise.all(
+    affectedSockets.map((socket) =>
+      socket.leave(`meeting:${meetingId}`)
+    )
+  );
+
+  if (affectedSockets.length > 0) {
+    broadcastEmployeeState();
+
+    console.log(
+      `${employeeId} left meeting ${meetingId}. Office presence restored.`
+    );
+  }
+
+  return affectedSockets.length;
+}
+
+// Restore everyone currently marked as being inside a meeting.
+
+async function restoreMeetingPresenceForMeeting(meetingId) {
+  const employeeIds = new Set();
+
+  for (const employee of employees.values()) {
+    if (employee.activeMeetingId === meetingId) {
+      employeeIds.add(employee.userId);
+    }
+  }
+
+  let restoredCount = 0;
+
+  for (const employeeId of employeeIds) {
+    restoredCount += await restoreMeetingPresence(
+      employeeId,
+      meetingId
+    );
+  }
+
+  return restoredCount;
+}
+
+// Expose these functions to meetingRoutes.js.
+app.set("restoreMeetingPresence", restoreMeetingPresence);
+app.set(
+  "restoreMeetingPresenceForMeeting",
+  restoreMeetingPresenceForMeeting
+);
 
 // ==========================================
 // HEALTH CHECK
@@ -548,9 +589,7 @@ function broadcastEmployeeState() {
 app.get("/", (req, res) => {
   res.json({
     success: true,
-
     message: "ProxiSpeak backend is running.",
-
     coordinateSystem: "Virtual office pixels (x, y)",
 
     office: {
@@ -559,22 +598,15 @@ app.get("/", (req, res) => {
     },
 
     rooms: Object.values(ROOMS),
-
     defaultRoom: DEFAULT_ROOM,
-
     defaultVoiceRangePixels: DEFAULT_VOICE_RANGE,
-
     availableWorkspaceVoiceRanges: ALLOWED_VOICE_RANGES,
-
     collisionDistancePixels: COLLISION_DISTANCE,
-
     connectedEmployees: employees.size,
-
     cachedEmployeePositions: employeePositions.size,
-
     chatEnabled: true,
-
     chatStorage: "Temporary frontend state only",
+    meetingSignaling: true,
   });
 });
 
@@ -597,12 +629,12 @@ app.post("/api/spatial-audit/demo-data", async (req, res) => {
       },
       {
         userId: "rithvik",
-        name: "Rithvik",
+        name: "Rithvik Kolipaka",
         location: [650, 250],
       },
       {
         userId: "abdul",
-        name: "Abdul",
+        name: "Abdul Muhyee",
         location: [690, 270],
       },
     ];
@@ -619,13 +651,8 @@ app.post("/api/spatial-audit/demo-data", async (req, res) => {
 
     res.json({
       success: true,
-
-      message:
-        "Virtual-office demo data inserted successfully.",
-
-      note:
-        "These are fixed database test records, not live positions.",
-
+      message: "Virtual-office demo data inserted successfully.",
+      note: "These are fixed database test records, not live positions.",
       coordinateSystem: "Virtual office pixels (x, y)",
 
       employees: demoEmployees.map((employee) => ({
@@ -657,7 +684,6 @@ app.get("/api/spatial-audit", (req, res) => {
     const x = Number(req.query.x ?? 400);
     const y = Number(req.query.y ?? 250);
     const radius = Number(req.query.radius ?? 500);
-
     const roomId = req.query.room || DEFAULT_ROOM;
 
     if (!isValidRoom(roomId)) {
@@ -680,10 +706,8 @@ app.get("/api/spatial-audit", (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-
         message:
           "Provide valid x and y coordinates inside the virtual office and a positive radius.",
-
         office: {
           width: OFFICE_WIDTH,
           height: OFFICE_HEIGHT,
@@ -695,7 +719,9 @@ app.get("/api/spatial-audit", (req, res) => {
 
     const liveEmployees = Array.from(employees.values())
       .filter(
-        (employee) => employee.currentRoom === roomId
+        (employee) =>
+          !employee.activeMeetingId &&
+          employee.currentRoom === roomId
       )
       .map((employee) => ({
         userId: employee.userId,
@@ -721,11 +747,7 @@ app.get("/api/spatial-audit", (req, res) => {
 
         return {
           ...employee,
-
-          distancePixels: Number(
-            exactDistance.toFixed(2)
-          ),
-
+          distancePixels: Number(exactDistance.toFixed(2)),
           exactDistance,
         };
       })
@@ -740,11 +762,7 @@ app.get("/api/spatial-audit", (req, res) => {
     const clusters = [];
     const assigned = new Set();
 
-    for (
-      let i = 0;
-      i < nearbyEmployees.length;
-      i++
-    ) {
+    for (let i = 0; i < nearbyEmployees.length; i++) {
       if (assigned.has(i)) continue;
 
       const cluster = [];
@@ -754,17 +772,11 @@ app.get("/api/spatial-audit", (req, res) => {
 
       while (queue.length > 0) {
         const currentIndex = queue.shift();
-
-        const currentEmployee =
-          nearbyEmployees[currentIndex];
+        const currentEmployee = nearbyEmployees[currentIndex];
 
         cluster.push(currentEmployee);
 
-        for (
-          let j = 0;
-          j < nearbyEmployees.length;
-          j++
-        ) {
+        for (let j = 0; j < nearbyEmployees.length; j++) {
           if (assigned.has(j)) continue;
 
           const candidate = nearbyEmployees[j];
@@ -790,31 +802,16 @@ app.get("/api/spatial-audit", (req, res) => {
 
     return res.json({
       success: true,
-
-      dataSource:
-        "Live Socket.IO virtual-office positions",
-
-      coordinateSystem:
-        "Virtual office pixels (x, y)",
-
+      dataSource: "Live Socket.IO virtual-office positions",
+      coordinateSystem: "Virtual office pixels (x, y)",
       room: getRoomInfo(roomId),
-
       searchCenter: { x, y },
-
       radiusPixels: radius,
-
-      clusterDistancePixels:
-        CLUSTER_DISTANCE_PIXELS,
-
-      collisionDistancePixels:
-        COLLISION_DISTANCE,
-
+      clusterDistancePixels: CLUSTER_DISTANCE_PIXELS,
+      collisionDistancePixels: COLLISION_DISTANCE,
       totalConnectedEmployees: liveEmployees.length,
-
       nearbyCount: nearbyEmployees.length,
-
       nearbyEmployees,
-
       clusterCount: clusters.length,
 
       clusters: clusters.map((cluster, index) => ({
@@ -827,12 +824,8 @@ app.get("/api/spatial-audit", (req, res) => {
         queryTimeMs,
         totalProcessingMs,
         targetMs: TARGET_QUERY_TIME_MS,
-
-        queryWithinTarget:
-          queryTimeMs < TARGET_QUERY_TIME_MS,
-
-        totalWithinTarget:
-          totalProcessingMs < TARGET_QUERY_TIME_MS,
+        queryWithinTarget: queryTimeMs < TARGET_QUERY_TIME_MS,
+        totalWithinTarget: totalProcessingMs < TARGET_QUERY_TIME_MS,
       },
     });
   } catch (error) {
@@ -856,22 +849,18 @@ io.on("connection", (socket) => {
   const userId = authenticatedEmployee.userId;
   const name = authenticatedEmployee.name;
 
-  // Every new connection starts in Workspace.
+  socket.join(`employee:${userId}`);
+
+  if (authenticatedEmployee.teamId) {
+    socket.join(`team:${authenticatedEmployee.teamId}`);
+  }
+
   const initialRoom = DEFAULT_ROOM;
 
-  // Restore this employee's Workspace position.
-  const savedPosition = getSavedPosition(
-    userId,
-    initialRoom
-  );
+  const savedPosition = getSavedPosition(userId, initialRoom);
 
-  const preferredX = savedPosition
-    ? savedPosition.x
-    : 400;
-
-  const preferredY = savedPosition
-    ? savedPosition.y
-    : 250;
+  const preferredX = savedPosition ? savedPosition.x : 400;
+  const preferredY = savedPosition ? savedPosition.y : 250;
 
   const spawnPosition = findFreePosition(
     preferredX,
@@ -894,37 +883,327 @@ io.on("connection", (socket) => {
 
   const employee = {
     socketId: socket.id,
-
     userId,
     name,
-
     role: authenticatedEmployee.role,
     department: authenticatedEmployee.department,
-
-    // Team information from MongoDB
     teamId: authenticatedEmployee.teamId,
     teamName: authenticatedEmployee.teamName,
-
     currentRoom: initialRoom,
-
     x: spawnPosition.x,
     y: spawnPosition.y,
-
     isVoiceActive: false,
     isMuted: false,
-
     voiceRange: DEFAULT_VOICE_RANGE,
+
+    // null = normal office presence.
+    // Meeting ID = hidden from the virtual office.
+    activeMeetingId: null,
   };
 
   employees.set(socket.id, employee);
-
   saveEmployeePosition(employee);
 
   console.log(
-    `${name} (${userId}) connected | Team: ${employee.teamName || "Unassigned"} | ${getRoomInfo(initialRoom).name} | X:${employee.x}, Y:${employee.y}`
+    `${name} (${userId}) connected | Team: ${
+      employee.teamName || "Unassigned"
+    } | ${getRoomInfo(initialRoom).name} | X:${employee.x}, Y:${employee.y}`
   );
 
   broadcastEmployeeState();
+
+  // ========================================
+  // AUTHORIZED MEETING SOCKET ROOM JOIN
+  // ========================================
+
+  socket.on("joinMeeting", async (payload = {}, callback) => {
+    const respond = (result) => {
+      if (typeof callback === "function") {
+        callback(result);
+      } else {
+        socket.emit("meetingSocketError", result);
+      }
+    };
+
+    try {
+      const meetingId = payload.meetingId;
+
+      if (
+        typeof meetingId !== "string" ||
+        !mongoose.Types.ObjectId.isValid(meetingId)
+      ) {
+        return respond({
+          success: false,
+          message: "Invalid meeting ID.",
+        });
+      }
+
+      const meeting = await Meeting.findById(meetingId);
+
+      if (!meeting) {
+        return respond({
+          success: false,
+          message: "Meeting not found.",
+        });
+      }
+
+      if (meeting.status !== "live") {
+        return respond({
+          success: false,
+          message: "This meeting is not currently live.",
+        });
+      }
+
+      const isHost = meeting.hostEmployeeId === userId;
+
+      const isSameTeam = Boolean(
+        authenticatedEmployee.teamId &&
+        meeting.teamId === authenticatedEmployee.teamId
+      );
+
+      const hasApprovedAccess = meeting.accessRequests.some(
+        (request) =>
+          request.employeeId === userId &&
+          request.status === "approved"
+      );
+
+      const isActiveParticipant = meeting.participants.some(
+        (participant) =>
+          participant.employeeId === userId &&
+          !participant.leftAt
+      );
+
+      if (
+        !(isHost || isSameTeam || hasApprovedAccess) ||
+        !isActiveParticipant
+      ) {
+        return respond({
+          success: false,
+          message:
+            "You must be an authorized active participant to enter this meeting.",
+        });
+      }
+
+      const currentEmployee = employees.get(socket.id);
+
+      if (!currentEmployee) {
+        return respond({
+          success: false,
+          message: "Employee session not found.",
+        });
+      }
+
+      if (
+        currentEmployee.activeMeetingId &&
+        currentEmployee.activeMeetingId !== meetingId
+      ) {
+        return respond({
+          success: false,
+          message: "You are already inside another meeting.",
+        });
+      }
+
+      const meetingRoom = `meeting:${meetingId}`;
+      const alreadyJoined = socket.rooms.has(meetingRoom);
+
+      await socket.join(meetingRoom);
+
+      currentEmployee.activeMeetingId = meetingId;
+      currentEmployee.isVoiceActive = false;
+      currentEmployee.isMuted = false;
+
+      employees.set(socket.id, currentEmployee);
+
+      // Hide the employee from the office and remove
+      // their workspace voice peers immediately.
+      broadcastEmployeeState();
+
+      const connectedSockets = await io
+        .in(meetingRoom)
+        .fetchSockets();
+
+      const connectedParticipants = connectedSockets.map(
+        (meetingSocket) => ({
+          socketId: meetingSocket.id,
+          employeeId: meetingSocket.data.employee?.userId,
+          name: meetingSocket.data.employee?.name,
+        })
+      );
+
+      const activeParticipants = meeting.participants
+        .filter((participant) => !participant.leftAt)
+        .map((participant) => ({
+          employeeId: participant.employeeId,
+          name: participant.name,
+          joinedAt: participant.joinedAt,
+        }));
+
+      if (!alreadyJoined) {
+        socket.to(meetingRoom).emit(
+          "meetingSocketParticipantConnected",
+          {
+            meetingId,
+            socketId: socket.id,
+            employeeId: userId,
+            name,
+          }
+        );
+      }
+
+      return respond({
+        success: true,
+        message: "Joined meeting socket room successfully.",
+        meetingId,
+        participants: activeParticipants,
+        connectedParticipants,
+      });
+    } catch (error) {
+      console.error("Meeting socket join error:", error);
+
+      return respond({
+        success: false,
+        message: "Unable to join the meeting socket room.",
+      });
+    }
+  });
+
+  // ========================================
+  // LEAVE MEETING AND RESTORE OFFICE PRESENCE
+  // ========================================
+
+  socket.on("leaveMeeting", async (payload = {}, callback) => {
+    const meetingId =
+      typeof payload.meetingId === "string"
+        ? payload.meetingId
+        : "";
+
+    const respond = (result) => {
+      if (typeof callback === "function") {
+        callback(result);
+      } else {
+        socket.emit("meetingSocketError", result);
+      }
+    };
+
+    if (!meetingId) {
+      return respond({
+        success: false,
+        message: "Meeting ID is required.",
+      });
+    }
+
+    try {
+      const restored = await restoreMeetingPresence(
+        userId,
+        meetingId
+      );
+
+      return respond({
+        success: true,
+        restored,
+        message: "Office presence restored.",
+      });
+    } catch (error) {
+      console.error("Meeting leave socket error:", error);
+
+      return respond({
+        success: false,
+        message: "Unable to restore office presence.",
+      });
+    }
+  });
+
+  // ========================================
+  // ISOLATED MEETING WEBRTC SIGNALING
+  // ========================================
+
+  socket.on("meetingSignal", async (payload = {}) => {
+    try {
+      const {
+        meetingId,
+        targetSocketId,
+        signal,
+      } = payload;
+
+      if (
+        typeof meetingId !== "string" ||
+        !mongoose.Types.ObjectId.isValid(meetingId)
+      ) {
+        return;
+      }
+
+      if (
+        typeof targetSocketId !== "string" ||
+        !targetSocketId ||
+        targetSocketId === socket.id
+      ) {
+        return;
+      }
+
+      if (
+        !signal ||
+        typeof signal !== "object" ||
+        Array.isArray(signal) ||
+        typeof signal.type !== "string" ||
+        !ALLOWED_MEETING_SIGNAL_TYPES.includes(signal.type)
+      ) {
+        return;
+      }
+
+      const meetingRoom = `meeting:${meetingId}`;
+
+      if (!socket.rooms.has(meetingRoom)) return;
+
+      const roomSockets = io.sockets.adapter.rooms.get(meetingRoom);
+
+      if (!roomSockets || !roomSockets.has(targetSocketId)) {
+        return;
+      }
+
+      const meeting = await Meeting.findById(meetingId)
+        .select("status");
+
+      if (!meeting || meeting.status !== "live") return;
+
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+
+      if (!targetSocket || !targetSocket.data.employee) return;
+
+      let signalSize;
+
+      try {
+        signalSize = Buffer.byteLength(
+          JSON.stringify(signal),
+          "utf8"
+        );
+      } catch {
+        return;
+      }
+
+      if (signalSize > MAX_MEETING_SIGNAL_SIZE) {
+        socket.emit("meetingSignalError", {
+          meetingId,
+          message: "Meeting signaling payload is too large.",
+        });
+
+        return;
+      }
+
+      io.to(targetSocketId).emit("meetingSignal", {
+        meetingId,
+        fromSocketId: socket.id,
+        fromEmployeeId: authenticatedEmployee.userId,
+        fromName: authenticatedEmployee.name,
+        signal,
+      });
+    } catch (error) {
+      console.error("Meeting signaling error:", error.message);
+
+      socket.emit("meetingSignalError", {
+        message: "Unable to process meeting signaling data.",
+      });
+    }
+  });
 
   // ========================================
   // ROOM SWITCHING
@@ -934,6 +1213,21 @@ io.on("connection", (socket) => {
     const currentEmployee = employees.get(socket.id);
 
     if (!currentEmployee) return;
+
+    if (currentEmployee.activeMeetingId) {
+      const result = {
+        success: false,
+        message: "Leave the meeting before switching office rooms.",
+      };
+
+      if (typeof callback === "function") {
+        callback(result);
+      } else {
+        socket.emit("roomSwitchError", result);
+      }
+
+      return;
+    }
 
     const requestedRoom =
       typeof payload.roomId === "string"
@@ -963,10 +1257,7 @@ io.on("connection", (socket) => {
         employee: currentEmployee,
       };
 
-      if (typeof callback === "function") {
-        callback(result);
-      }
-
+      if (typeof callback === "function") callback(result);
       return;
     }
 
@@ -1010,15 +1301,12 @@ io.on("connection", (socket) => {
     }
 
     currentEmployee.currentRoom = requestedRoom;
-
     currentEmployee.x = destinationPosition.x;
     currentEmployee.y = destinationPosition.y;
-
     currentEmployee.isVoiceActive = false;
     currentEmployee.isMuted = false;
 
     employees.set(socket.id, currentEmployee);
-
     saveEmployeePosition(currentEmployee);
 
     console.log(
@@ -1029,31 +1317,31 @@ io.on("connection", (socket) => {
 
     const result = {
       success: true,
-
       previousRoom,
-
       currentRoom: requestedRoom,
-
       room: getRoomInfo(requestedRoom),
-
       employee: currentEmployee,
     };
 
     socket.emit("roomChanged", result);
 
-    if (typeof callback === "function") {
-      callback(result);
-    }
+    if (typeof callback === "function") callback(result);
   });
 
   // ========================================
-  // EMPLOYEE MOVEMENT WITH COLLISION CONTROL
+  // EMPLOYEE MOVEMENT
   // ========================================
 
   socket.on("employeeMove", (movement) => {
     const currentEmployee = employees.get(socket.id);
 
-    if (!currentEmployee || !movement) return;
+    if (
+      !currentEmployee ||
+      currentEmployee.activeMeetingId ||
+      !movement
+    ) {
+      return;
+    }
 
     const targetX = Number(movement.x);
     const targetY = Number(movement.y);
@@ -1075,7 +1363,6 @@ io.on("connection", (socket) => {
     currentEmployee.y = resolvedPosition.y;
 
     employees.set(socket.id, currentEmployee);
-
     saveEmployeePosition(currentEmployee);
 
     broadcastEmployeeState();
@@ -1103,9 +1390,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (
-      messageText.length > MAX_CHAT_MESSAGE_LENGTH
-    ) {
+    if (messageText.length > MAX_CHAT_MESSAGE_LENGTH) {
       socket.emit("chatError", {
         message:
           `Messages cannot exceed ${MAX_CHAT_MESSAGE_LENGTH} characters.`,
@@ -1116,12 +1401,9 @@ io.on("connection", (socket) => {
 
     const chatMessage = {
       id: `${Date.now()}-${socket.id}`,
-
       senderId: currentEmployee.userId,
       senderName: currentEmployee.name,
-
       message: messageText,
-
       timestamp: new Date().toISOString(),
     };
 
@@ -1139,7 +1421,9 @@ io.on("connection", (socket) => {
   socket.on("setVoiceRange", (payload = {}) => {
     const currentEmployee = employees.get(socket.id);
 
-    if (!currentEmployee) return;
+    if (!currentEmployee || currentEmployee.activeMeetingId) {
+      return;
+    }
 
     const selectedRange = Number(payload.voiceRange);
 
@@ -1147,7 +1431,6 @@ io.on("connection", (socket) => {
       socket.emit("voiceRangeError", {
         message:
           "Voice range must be either 75 or 120 pixels.",
-
         allowedRanges: ALLOWED_VOICE_RANGES,
       });
 
@@ -1155,7 +1438,6 @@ io.on("connection", (socket) => {
     }
 
     currentEmployee.voiceRange = selectedRange;
-
     employees.set(socket.id, currentEmployee);
 
     console.log(
@@ -1172,7 +1454,9 @@ io.on("connection", (socket) => {
   socket.on("voiceStatus", (status = {}) => {
     const currentEmployee = employees.get(socket.id);
 
-    if (!currentEmployee) return;
+    if (!currentEmployee || currentEmployee.activeMeetingId) {
+      return;
+    }
 
     currentEmployee.isVoiceActive =
       status.isVoiceActive === true;
@@ -1196,8 +1480,7 @@ io.on("connection", (socket) => {
   });
 
   // ========================================
-  // WEBRTC VOICE SIGNALING
-  // ROOM-ISOLATED + RANGE-VALIDATED
+  // WORKSPACE WEBRTC VOICE SIGNALING
   // ========================================
 
   socket.on("voiceSignal", (payload = {}) => {
@@ -1207,6 +1490,7 @@ io.on("connection", (socket) => {
 
     if (
       !sender ||
+      sender.activeMeetingId ||
       typeof targetSocketId !== "string" ||
       !signal ||
       typeof signal !== "object" ||
@@ -1218,11 +1502,9 @@ io.on("connection", (socket) => {
 
     const target = employees.get(targetSocketId);
 
-    if (!target) return;
+    if (!target || target.activeMeetingId) return;
 
-    if (sender.currentRoom !== target.currentRoom) {
-      return;
-    }
+    if (sender.currentRoom !== target.currentRoom) return;
 
     const allowedSignalTypes = [
       "voice-ready",
@@ -1266,6 +1548,22 @@ io.on("connection", (socket) => {
 
     if (disconnectedEmployee) {
       saveEmployeePosition(disconnectedEmployee);
+
+      for (const room of socket.rooms) {
+        if (room.startsWith("meeting:")) {
+          const meetingId = room.slice("meeting:".length);
+
+          socket.to(room).emit(
+            "meetingSocketParticipantDisconnected",
+            {
+              meetingId,
+              socketId: socket.id,
+              employeeId: disconnectedEmployee.userId,
+              name: disconnectedEmployee.name,
+            }
+          );
+        }
+      }
     }
 
     employees.delete(socket.id);
@@ -1298,9 +1596,7 @@ async function startServer() {
 
     await mongoose.connect(process.env.MONGODB_URI);
 
-    console.log(
-      "MongoDB Atlas connected successfully!"
-    );
+    console.log("MongoDB Atlas connected successfully!");
 
     const indexes =
       await UserLocation.collection.indexes();
@@ -1311,9 +1607,7 @@ async function startServer() {
         index.key &&
         index.key.location
       ) {
-        await UserLocation.collection.dropIndex(
-          index.name
-        );
+        await UserLocation.collection.dropIndex(index.name);
 
         console.log(
           `Removed old location index: ${index.name}`
@@ -1326,9 +1620,7 @@ async function startServer() {
       { unique: true }
     );
 
-    console.log(
-      "Virtual-office location model ready."
-    );
+    console.log("Virtual-office location model ready.");
 
     server.listen(PORT, () => {
       console.log(
@@ -1360,29 +1652,26 @@ async function startServer() {
       );
 
       console.log(
-        "Meeting room voice: unrestricted group"
+        "Conference Room voice: unrestricted group"
       );
 
-      console.log(
-        "Room-specific avatar positions: enabled"
-      );
-
-      console.log(
-        "Room-specific collision detection: enabled"
-      );
-
-      console.log(
-        "Room-isolated WebRTC signaling: enabled"
-      );
-
-      console.log(
-        "Spatial audit source: live room positions"
-      );
-
+      console.log("Room-specific avatar positions: enabled");
+      console.log("Room-specific collision detection: enabled");
+      console.log("Room-isolated WebRTC signaling: enabled");
+      console.log("Spatial audit source: live room positions");
       console.log("WebRTC signaling: enabled");
       console.log("Live voice status tracking: enabled");
       console.log("Avatar collision detection: enabled");
       console.log("Real-time office chat: enabled");
+
+      console.log("Meeting Socket.IO: enabled");
+      console.log("Meeting authorization: MongoDB-backed");
+      console.log("Employee notification rooms: enabled");
+      console.log("Team notification rooms: enabled");
+      console.log("Meeting WebRTC signaling: enabled");
+      console.log("Meeting screen-share signaling: enabled");
+      console.log("Meeting presence isolation: enabled");
+      console.log("Meeting office-presence restoration: enabled");
 
       console.log(
         "Chat message storage: disabled (temporary)"

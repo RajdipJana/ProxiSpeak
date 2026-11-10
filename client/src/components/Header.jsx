@@ -48,18 +48,11 @@ function Header({
         )[0]
       : null;
 
+  // Only the Conference Room remains in the dropdown.
   const roomItems = [
     {
       label: "Conference Room",
       roomId: "conference",
-    },
-    {
-      label: "Meeting Room 01",
-      roomId: "meeting1",
-    },
-    {
-      label: "Meeting Room 02",
-      roomId: "meeting2",
     },
   ];
 
@@ -88,8 +81,6 @@ function Header({
   function handleRoomSelection(roomId) {
     setRoomsOpen(false);
 
-    // If already in this room, simply return to the Virtual Office.
-    // Do not request another room transition or disconnect voice.
     if (roomId === currentRoom) {
       if (currentPage !== "VirtualOffice") {
         onNavigate("VirtualOffice");
@@ -98,7 +89,6 @@ function Header({
       return;
     }
 
-    // Different room: request confirmation through App.jsx.
     if (onRequestRoomChange) {
       onRequestRoomChange(roomId);
     } else {
@@ -204,7 +194,7 @@ function Header({
               <span className="nav-label">Workspace</span>
             </button>
 
-            {/* ROOMS DROPDOWN */}
+            {/* CONFERENCE ROOM DROPDOWN */}
             <div
               className="rooms-nav-container"
               ref={roomsDropdownRef}
